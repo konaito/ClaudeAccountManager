@@ -10,14 +10,13 @@ https://code.claude.com/docs/en/authentication
 アカウントごとに分かれるもの:
 
 - ログイン（macOS の Keychain の項目は `CLAUDE_CONFIG_DIR` ごとに別になる）
-- `.claude.json`（ログイン中のアカウント情報を含む）
+- `.claude.json`（ログイン中のアカウント情報を含む）と、その控えの `backups`
 - 組織ごとの値（`policy-limits.json`、`remote-settings.json`）
+- MCP の認証状態（`mcp-needs-auth-cache.json`）
 
-`~/.claude` へのシンボリックリンクで共通にするもの:
+それ以外の `~/.claude` の中身は、全部シンボリックリンクで共通にします。設定、スキル、会話履歴に加えて、`sessions` も共通です。そのため、どのアカウントで起動したセッションからも、`ListAgents` と `SendMessage` でほかのセッションが見えます。
 
-- CLAUDE.md、settings.json、keybindings.json、statusline-command.sh
-- skills、commands、agents、rules、hooks、plugins、output-styles
-- projects、history.jsonl、file-history、plans、todos（会話履歴と記憶）
+Claude Code が起動後に作るフォルダ（`sessions`、`session-env`、`teams`、`tasks` など）は、`~/.claude` に先に作ってからリンクを張ります。プロファイルにすでに実体があるときは、中身を `~/.claude` に移してからリンクにします。`~/.claude` に同じ名前のものがあれば、捨てずにプロファイルの `.cam-replaced/<時刻>/` に残します。
 
 ユーザーの MCP サーバーは、起動のたびに `~/.claude.json` の `mcpServers` をプロファイル側へ写します。
 

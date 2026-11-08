@@ -2,7 +2,7 @@
 # cam: Claude Account Manager
 # 1つの Mac で Claude Code をアカウントごとのコマンド（ceo, cto ...）で並べて起動する。
 # 公式の CLAUDE_CONFIG_DIR を使う。ログイン（Keychain）だけ別で、
-# CLAUDE.md・settings・skills・hooks・plugins・履歴は ~/.claude へのリンクで共有し、
+# ~/.claude の中身はアカウントごとの値を除いて全部リンクで共有し、
 # ユーザー MCP（~/.claude.json の mcpServers）は起動のたびに同期する。
 # 共有リストは Nael-Nathanael/ccd（MIT）を参考にした。
 set -euo pipefail
@@ -13,11 +13,14 @@ CAM_HOME="$HOME/.cam"
 PROFILES="$CAM_HOME/profiles"
 BIN="$CAM_HOME/bin"
 
-# ~/.claude から共有するもの（許可リスト）。
-# policy-limits.json・remote-settings.json などは組織ごとの値なので入れない。
-SHARED=(CLAUDE.md settings.json keybindings.json statusline-command.sh
-        skills commands agents rules hooks plugins output-styles
-        projects history.jsonl file-history plans todos)
+# ~/.claude の中身は、下の PER_ACCOUNT に当たるもの以外を全部リンクで共有する。
+# sessions も共有するので、どのアカウントのセッションからも ListAgents と SendMessage で互いが見える。
+# アカウントごとに分けるもの: ログイン（Keychain）、.claude.json（プロファイル直下。mcpServers だけ同期）、
+# 組織ごとの値（policy-limits.json・remote-settings.json）、MCP の認証状態、.claude.json の控え（backups）。
+PER_ACCOUNT=(.claude.json .credentials.json .credentials.lock mcp-needs-auth-cache.json backups
+             'policy-limits.json*' 'remote-settings.json*' '*.bak' '*.bak-*' '*.tmp.*' .DS_Store)
+# Claude Code が起動後に作るフォルダ。~/.claude に先に作っておき、プロファイルに実体ができる前にリンクを張る。
+RUNTIME_DIRS=(sessions session-env shell-snapshots teams tasks todos jobs ide debug paste-cache telemetry cache)
 
 die() { echo "cam: $*" >&2; exit 1; }
 
@@ -25,16 +28,58 @@ valid_name() {
     [[ "$1" =~ ^[a-z][a-z0-9_-]*$ ]] || die "名前は英小文字で始まる英数字・-・_ にしてください: $1"
 }
 
+per_account() {
+    local pat
+    for pat in "${PER_ACCOUNT[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$1" == $pat ]] && return 0
+    done
+    return 1
+}
+
+# プロファイルに実体があるものを ~/.claude 側へ移してからリンクにする。
+# フォルダは中身を1つずつ移し、~/.claude に同じ名前があるものは捨てずに .cam-replaced/<時刻>/ に残す。
+# ファイルは丸ごと .cam-replaced/<時刻>/ に残す。動いているセッションのファイルも、移した先をリンク経由で使い続ける。
+adopt() {
+    local dir="$1" f="$2" src="$1/$2" dst="$MASTER/$2" keep c
+    keep="$dir/.cam-replaced/$(date +%Y%m%d-%H%M%S)"
+    if [[ -d "$src" && -d "$dst" ]]; then
+        shopt -s nullglob dotglob
+        for c in "$src"/*; do
+            if [[ -e "$dst/$(basename "$c")" || -L "$dst/$(basename "$c")" ]]; then
+                mkdir -p "$keep/$f"
+                mv "$c" "$keep/$f/"
+            else
+                mv "$c" "$dst/"
+            fi
+        done
+        shopt -u nullglob dotglob
+        rmdir "$src"
+    else
+        mkdir -p "$keep"
+        mv "$src" "$keep/"
+    fi
+    ln -s "$dst" "$src"
+    echo "cam: $(basename "$dir")/$f を ~/.claude/$f へのリンクにしました" >&2
+}
+
 # プロファイルの共有リンクを張り直し、mcpServers を同期する
 sync_profile() {
-    local name="$1" dir="$PROFILES/$1" f
+    local name="$1" dir="$PROFILES/$1" f d
     [[ -d "$dir" ]] || die "プロファイルがありません: $name"
-    for f in "${SHARED[@]}"; do
-        [[ -e "$MASTER/$f" ]] || continue
+    for d in "${RUNTIME_DIRS[@]}"; do
+        [[ -e "$MASTER/$d" ]] || mkdir -p "$MASTER/$d"
+    done
+    shopt -s nullglob dotglob
+    local entries=("$MASTER"/*)
+    shopt -u nullglob dotglob
+    for f in "${entries[@]}"; do
+        f=$(basename "$f")
+        per_account "$f" && continue
         if [[ -L "$dir/$f" ]]; then
             continue
         elif [[ -e "$dir/$f" ]]; then
-            echo "cam: $dir/$f が実体になっていて共有されていません（手で確認してください）" >&2
+            adopt "$dir" "$f"
         else
             ln -s "$MASTER/$f" "$dir/$f"
         fi
