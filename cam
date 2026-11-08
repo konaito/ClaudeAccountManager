@@ -248,19 +248,57 @@ token_of() {
         | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true
 }
 
-# 5時間枠と7日枠の使用率（%）とリセット時刻（epoch 秒、不明は 0）を
-# 「5h 7d 5hのリセット 7dのリセット」で出す。取れなければ何も出さない。
-# /api/oauth/usage は公開されていない API なので、変わったら auto だけ動かなくなる。
+# 使用率を API から取り、「状態 5h 7d 5hのリセット 7dのリセット」で出す。
+# 状態は ok（取れた）、limited（429 で断られた）、notoken（トークンが無いか期限切れ）、error（それ以外）。
+# ok 以外は数値の欄が「- - 0 0」になる。リセット時刻は epoch 秒で、不明は 0。
+# /api/oauth/usage は公開されていない API で、低い頻度でも 429 を返すことがある。
 usage_of() {
-    local tok
+    local tok res code body line
     tok=$(token_of "$1")
-    [[ -n "$tok" ]] || return 0
-    curl -sf -m 5 https://api.anthropic.com/api/oauth/usage \
-        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null \
-        | jq -r 'def epoch: try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch 0;
-                 select(.five_hour.utilization != null)
-                 | "\(.five_hour.utilization) \(.seven_day.utilization // 0)"
-                   + " \(.five_hour.resets_at | epoch) \(.seven_day.resets_at | epoch)"' 2>/dev/null || true
+    [[ -n "$tok" ]] || { echo "notoken - - 0 0"; return 0; }
+    res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
+        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || res=$'\n000'
+    code=${res##*$'\n'}
+    body=${res%$'\n'*}
+    case "$code" in
+        200) ;;
+        429) echo "limited - - 0 0"; return 0 ;;
+        401) echo "notoken - - 0 0"; return 0 ;;
+        *) echo "error - - 0 0"; return 0 ;;
+    esac
+    line=$(jq -r 'def epoch: try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch 0;
+                  select(.five_hour.utilization != null)
+                  | "ok \(.five_hour.utilization) \(.seven_day.utilization // 0)"
+                    + " \(.five_hour.resets_at | epoch) \(.seven_day.resets_at | epoch)"' <<<"$body" 2>/dev/null)
+    echo "${line:-error - - 0 0}"
+}
+
+# 前回取れた使用率の控え。1行「5h 7d 5hのリセット 7dのリセット 取った時刻」で、コマンドごとに1ファイル。
+USAGE_CACHE="$CAM_HOME/usage-cache"
+
+# 1コマンドぶんの行「名前 状態 5h 7d 5hのリセット 7dのリセット 値の時刻」を出す。
+# 取れたら控えを書き、取れなければ控えを状態 cached で出す。
+# 控えのリセット時刻を過ぎた枠は、使用率を 0、リセット時刻を不明にする。
+usage_row() {
+    local name="$1" now st five seven r5 r7 at tmp
+    now=$(date +%s)
+    read -r st five seven r5 r7 <<<"$(usage_of "$name")"
+    if [[ "$st" == ok ]]; then
+        mkdir -p "$USAGE_CACHE"
+        tmp=$(mktemp "$USAGE_CACHE/.$name.XXXXXX")
+        echo "$five $seven $r5 $r7 $now" >"$tmp"
+        mv "$tmp" "$USAGE_CACHE/$name"
+        echo "$name ok $five $seven $r5 $r7 $now"
+        return 0
+    fi
+    if [[ -f "$USAGE_CACHE/$name" ]] \
+        && read -r five seven r5 r7 at <"$USAGE_CACHE/$name" && [[ -n "$at" ]]; then
+        if [[ "$r5" -gt 0 && "$r5" -le "$now" ]]; then five=0; r5=0; fi
+        if [[ "$r7" -gt 0 && "$r7" -le "$now" ]]; then seven=0; r7=0; fi
+        echo "$name cached $five $seven $r5 $r7 $at"
+        return 0
+    fi
+    echo "$name $st - - 0 0 0"
 }
 
 # リセット時刻（epoch 秒）をこの Mac の時刻で出す。不明なら「?」
@@ -268,8 +306,8 @@ until_of() {
     if [[ "${1:-0}" -gt 0 ]]; then date -r "$1" "+$2"; else echo '?'; fi
 }
 
-# コマンドごとの使用率を「名前 5h 7d 5hのリセット 7dのリセット」で1行ずつ出す。
-# 取れないコマンドは名前だけの行になる。API は全コマンド同時に呼び、並びはコマンド順に戻す。
+# コマンドごとの使用率を usage_row の形で1行ずつ出す。
+# API は全コマンド同時に呼び、並びはコマンド順に戻す。
 collect_usage() {
     local f name tmp i=0 j
     tmp=$(mktemp -d)
@@ -278,7 +316,7 @@ collect_usage() {
         name=$(basename "$f")
         [[ "$name" == cam ]] && continue
         i=$((i + 1))
-        echo "$name $(usage_of "$name")" >"$tmp/$i" &
+        usage_row "$name" >"$tmp/$i" &
     done
     wait
     for ((j = 1; j <= i; j++)); do cat "$tmp/$j"; done
@@ -297,38 +335,55 @@ fallback_of() {
 }
 
 # 5時間枠の使用率がいちばん低いコマンド。同じなら7日枠の低いほう。
-# どちらかの枠が 100% のコマンドと、使用率が取れないコマンドは選ばない。
+# どちらかの枠が 100% のコマンドと、使用率が取れず控えも無いコマンドは選ばない。
+# 控え（cached）の値も、取れた値と同じに扱う。
 best_of() {
-    awk 'NF >= 3 && $2 < 100 && $3 < 100' | sort -k2,2g -k3,3g | head -n1 | awk '{print $1}'
+    awk '($2 == "ok" || $2 == "cached") && $3 < 100 && $4 < 100' | sort -k3,3g -k4,4g | head -n1 | awk '{print $1}'
+}
+
+# 使用率が取れないときの理由
+reason_of() {
+    case "$1" in
+        limited) echo "API に断られた（429）。しばらくすると取れる" ;;
+        notoken) echo "トークンが無いか期限切れ。一度 $2 を起動すると更新される" ;;
+        *) echo "API から取れなかった" ;;
+    esac
 }
 
 print_usage_rows() {
-    local name five seven r5 r7
-    while read -r name five seven r5 r7; do
-        if [[ -z "$five" ]]; then
-            printf '  %-10s 不明（トークンが無いか期限切れ。一度 %s を起動すると更新される）\n' "$name" "$name"
+    local name st five seven r5 r7 at note
+    while read -r name st five seven r5 r7 at; do
+        [[ -n "$name" ]] || continue
+        if [[ "$st" != ok && "$st" != cached ]]; then
+            printf '  %-10s 不明（%s）\n' "$name" "$(reason_of "$st" "$name")"
             continue
         fi
-        printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）\n' \
-            "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')"
+        note=""
+        [[ "$st" == cached ]] && note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+        printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）%s\n' \
+            "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')" "$note"
     done
 }
 
-# メニューバーのアプリが読む JSON。使用率が取れないコマンドは five_hour などが null になる。
+# メニューバーのアプリが読む JSON。
+# status は ok・cached・limited・notoken・error。as_of は値を取った時刻（epoch 秒）。
+# 使用率が取れず控えも無いコマンドは five_hour などが null になる。
 usage_json() {
-    local rows="$1" best="$2" name five seven r5 r7 email
-    while read -r name five seven r5 r7; do
+    local rows="$1" best="$2" name st five seven r5 r7 at email
+    while read -r name st five seven r5 r7 at; do
         [[ -n "$name" ]] || continue
         if [[ -d "$PROFILES/$name" ]]; then
             email=$(account_of "$PROFILES/$name/.claude.json")
         else
             email=$(account_of "$MASTER_JSON")
         fi
-        jq -n --arg name "$name" --arg email "$email" \
-            --arg five "$five" --arg seven "$seven" --arg r5 "$r5" --arg r7 "$r7" \
-            'def num: if . == "" then null else tonumber end;
+        jq -n --arg name "$name" --arg email "$email" --arg st "$st" --arg reason "$(reason_of "$st" "$name")" \
+            --arg five "$five" --arg seven "$seven" --arg r5 "$r5" --arg r7 "$r7" --arg at "$at" \
+            'def num: if . == "" or . == "-" then null else tonumber end;
              def at: if . == "" or . == "0" then null else tonumber end;
-             {name: $name, email: $email,
+             {name: $name, email: $email, status: $st,
+              reason: (if $st == "ok" or $st == "cached" then null else $reason end),
+              as_of: ($at | at),
               five_hour: ($five | num), seven_day: ($seven | num),
               five_hour_resets_at: ($r5 | at), seven_day_resets_at: ($r7 | at)}'
     done <<<"$rows" | jq -s --arg best "$best" --argjson now "$(date +%s)" \
@@ -357,6 +412,7 @@ cmd_auto() {
     if [[ -z "$best" ]]; then
         best=$(fallback_of <<<"$rows")
         echo "cam: 使えるアカウントが判定できないので $best で起動します" >&2
+        print_usage_rows <<<"$rows" >&2
     fi
     exec "$BIN/$best" "$@"
 }
