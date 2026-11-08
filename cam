@@ -85,7 +85,7 @@ login_and_launch() {
     fi
     echo "${name} のアカウントでログインします（ブラウザが開きます）"
     if ! CLAUDE_CONFIG_DIR="$PROFILES/$name" claude auth login; then
-        die "ログインできませんでした。'cam login $name' でやり直すか、'$name' を起動して /login してください"
+        die "ログインできませんでした。'cam add $name' でやり直すか、'$name' を起動して /login してください"
     fi
     exec "$BIN/$name"
 }
@@ -103,7 +103,17 @@ cmd_add() {
     [[ -n "$name" ]] || die "使い方: cam add <名前> [--default] [--no-login]"
     valid_name "$name"
     [[ "$name" == cam ]] && die "cam は使えません"
-    [[ -e "$BIN/$name" ]] && die "$name はもうあります（cam list）"
+    if [[ -e "$BIN/$name" ]]; then
+        # 既にあるコマンドは、そのアカウントのログインし直しとして扱う
+        [[ -d "$PROFILES/$name" ]] || die "${name} は ~/.claude のログインで起動するコマンドです。ログインし直すなら '$name' を起動して /login してください"
+        [[ "$mode" == profile ]] || die "${name} はプロファイルのコマンドです（--default は付けられません）"
+        if [[ "$login" == 1 ]]; then
+            login_and_launch "$name"
+        else
+            echo "${name} はもうあります（cam list）"
+        fi
+        return 0
+    fi
     local other
     other=$(PATH="${PATH//$BIN:/}" command -v "$name" 2>/dev/null || true)
     [[ -n "$other" ]] && die "$name は既存のコマンド（${other}）と同じ名前です"
@@ -119,7 +129,7 @@ cmd_add() {
         if [[ "$login" == 1 ]]; then
             login_and_launch "$name"
         else
-            echo "次に 'cam login $name' か、'$name' を起動して /login でログインしてください"
+            echo "次に 'cam add $name' をもう一度実行するか、'$name' を起動して /login でログインしてください"
         fi
     else
         echo "作成: ${name}（~/.claude のログインで起動）"
@@ -220,15 +230,14 @@ case "${1:-}" in
     add) shift; cmd_add "$@" ;;
     auto) shift; cmd_auto "$@" ;;
     list|ls) cmd_list ;;
-    login) shift; [[ -n "${1:-}" ]] || die "使い方: cam login <名前>"; valid_name "$1"; login_and_launch "$1" ;;
     sync) shift; [[ -n "${1:-}" ]] || die "使い方: cam sync <名前>"; sync_profile "$1" ;;
     remove|rm) shift; cmd_remove "$@" ;;
     *) cat <<EOF
 cam: Claude Code をアカウントごとのコマンドで起動する
   cam add <名前>            プロファイルと <名前> コマンドを作り、ログインして起動する
+                            （既にあれば、そのアカウントでログインし直して起動する）
   cam add <名前> --default  ~/.claude のログインで起動する <名前> コマンドを作る
   cam add <名前> --no-login 作るだけでログインと起動はしない
-  cam login <名前>          <名前> のアカウントでログインし直して起動する
   cam list                  コマンドとログイン中のアカウント
   cam auto [引数]           5時間枠の使用率がいちばん低いコマンドで起動する
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）

@@ -40,7 +40,7 @@ echo 'export PATH="$HOME/.cam/bin:$PATH"' >> ~/.zshrc
 ```bash
 cam add ceo            # ~/.cam/profiles/ceo と ceo コマンドを作り、ログインして起動する
 cam add cto --no-login # 作るだけで、ログインと起動はしない
-cam login cto          # cto のアカウントでログインし直して起動する
+cam add cto            # 既にあるコマンドなら、そのアカウントでログインし直して起動する
 ceo                    # 2回目からはコマンドだけで起動する
 cam add coo --default  # ~/.claude のログインで起動する coo コマンドを作る
 cam list               # コマンドとログイン中のアカウント
@@ -51,7 +51,7 @@ cam remove ceo         # コマンドとプロファイルを消す
 
 既存のコマンドと同じ名前（`ls` など）は作れません。
 
-`cam add` と `cam login` は `claude auth login` でブラウザのログインを開き、通ったらそのまま Claude Code を起動します。端末から実行していないときはログインせず、手順だけを表示します。
+`cam add` は `claude auth login` でブラウザのログインを開き、通ったらそのまま Claude Code を起動します。端末から実行していないときはログインせず、手順だけを表示します。
 
 ## cam auto の選び方
 
