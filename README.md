@@ -1,0 +1,57 @@
+# cam
+
+cam は、1台の Mac で Claude Code をアカウントごとのコマンドで起動するための bash スクリプトです。`ceo` と打つと ceo@fybe.jp で、`claude` と打つと既定のアカウントで起動し、2つは別のターミナルで同時に動かせます。
+
+仕組みは公式ドキュメントの「Log in with multiple accounts」にある `CLAUDE_CONFIG_DIR` です。アカウントの自動切り替えはしません。
+https://code.claude.com/docs/en/authentication
+
+## 何が分かれて何が共通か
+
+アカウントごとに分かれるもの:
+
+- ログイン（macOS の Keychain の項目は `CLAUDE_CONFIG_DIR` ごとに別になる）
+- `.claude.json`（ログイン中のアカウント情報を含む）
+- 組織ごとの値（`policy-limits.json`、`remote-settings.json`）
+
+`~/.claude` へのシンボリックリンクで共通にするもの:
+
+- CLAUDE.md、settings.json、keybindings.json、statusline-command.sh
+- skills、commands、agents、rules、hooks、plugins、output-styles
+- projects、history.jsonl、file-history、plans、todos（会話履歴と記憶）
+
+ユーザーの MCP サーバーは、起動のたびに `~/.claude.json` の `mcpServers` をプロファイル側へ写します。
+
+## 置き場所
+
+- このリポジトリ: `cam` 本体
+- `~/.cam/bin/`: `cam` 本体へのリンクと、`cam add` で作った起動用コマンド（PATH に入れる）
+- `~/.cam/profiles/<名前>/`: 各アカウントの `CLAUDE_CONFIG_DIR`。ログイン情報が入るので git には入れない
+
+## 入れ方
+
+```bash
+mkdir -p ~/.cam/bin
+ln -s ~/Documents/cam/cam ~/.cam/bin/cam
+echo 'export PATH="$HOME/.cam/bin:$PATH"' >> ~/.zshrc
+```
+
+## 使い方
+
+```bash
+cam add ceo            # ~/.cam/profiles/ceo を作り、ceo コマンドを作る
+ceo                    # 初回は /login で ceo のアカウントにログインする
+cam add coo --default  # ~/.claude のログインで起動する coo コマンドを作る
+cam list               # コマンドとログイン中のアカウント
+cam sync ceo           # 共有リンクと MCP を同期する（起動時にも自動で行う）
+cam remove ceo         # コマンドとプロファイルを消す
+```
+
+既存のコマンドと同じ名前（`ls` など）は作れません。
+
+## 注意
+
+- API キーを使わない Claude Console のサインインは、保存先が `CLAUDE_CONFIG_DIR` の外にあるので、アカウントごとに分けられません（公式ドキュメントの記述）
+- リモートの MCP サーバーは、プロファイルごとにもう一度認証が要るかもしれません（未確認）
+- `cam remove` は Keychain の項目を消しません
+
+共通にするファイルの一覧は [ccd](https://github.com/Nael-Nathanael/ccd)（MIT）を参考にしました。

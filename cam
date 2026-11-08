@@ -1,0 +1,152 @@
+#!/bin/bash
+# cam: Claude Account Manager
+# 1つの Mac で Claude Code をアカウントごとのコマンド（ceo, cto ...）で並べて起動する。
+# 公式の CLAUDE_CONFIG_DIR を使う。ログイン（Keychain）だけ別で、
+# CLAUDE.md・settings・skills・hooks・plugins・履歴は ~/.claude へのリンクで共有し、
+# ユーザー MCP（~/.claude.json の mcpServers）は起動のたびに同期する。
+# 共有リストは Nael-Nathanael/ccd（MIT）を参考にした。
+set -euo pipefail
+
+MASTER="$HOME/.claude"
+MASTER_JSON="$HOME/.claude.json"
+CAM_HOME="$HOME/.cam"
+PROFILES="$CAM_HOME/profiles"
+BIN="$CAM_HOME/bin"
+
+# ~/.claude から共有するもの（許可リスト）。
+# policy-limits.json・remote-settings.json などは組織ごとの値なので入れない。
+SHARED=(CLAUDE.md settings.json keybindings.json statusline-command.sh
+        skills commands agents rules hooks plugins output-styles
+        projects history.jsonl file-history plans todos)
+
+die() { echo "cam: $*" >&2; exit 1; }
+
+valid_name() {
+    [[ "$1" =~ ^[a-z][a-z0-9_-]*$ ]] || die "名前は英小文字で始まる英数字・-・_ にしてください: $1"
+}
+
+# プロファイルの共有リンクを張り直し、mcpServers を同期する
+sync_profile() {
+    local name="$1" dir="$PROFILES/$1" f
+    [[ -d "$dir" ]] || die "プロファイルがありません: $name"
+    for f in "${SHARED[@]}"; do
+        [[ -e "$MASTER/$f" ]] || continue
+        if [[ -L "$dir/$f" ]]; then
+            continue
+        elif [[ -e "$dir/$f" ]]; then
+            echo "cam: $dir/$f が実体になっていて共有されていません（手で確認してください）" >&2
+        else
+            ln -s "$MASTER/$f" "$dir/$f"
+        fi
+    done
+    [[ -f "$MASTER_JSON" ]] || return 0
+    local pj="$dir/.claude.json" want have tmp
+    want=$(jq -c '.mcpServers // {}' "$MASTER_JSON")
+    if [[ -f "$pj" ]]; then
+        have=$(jq -c '.mcpServers // {}' "$pj" 2>/dev/null || echo invalid)
+        [[ "$have" == "$want" ]] && return 0
+        [[ "$have" == invalid ]] && { echo "cam: $pj を読めないので MCP は同期しません" >&2; return 0; }
+        tmp=$(mktemp "$dir/.claude.json.cam.XXXXXX")
+        jq --argjson m "$want" '.mcpServers = $m' "$pj" >"$tmp"
+    else
+        tmp=$(mktemp "$dir/.claude.json.cam.XXXXXX")
+        jq -n --argjson m "$want" '{mcpServers: $m}' >"$tmp"
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$pj"
+}
+
+write_launcher() {
+    local name="$1" mode="$2" out="$BIN/$1"
+    if [[ "$mode" == default ]]; then
+        cat >"$out" <<EOF
+#!/bin/bash
+# cam: $name は ~/.claude（既定のログイン）で起動する
+exec claude "\$@"
+EOF
+    else
+        cat >"$out" <<EOF
+#!/bin/bash
+# cam: $name は ~/.cam/profiles/$name で起動する
+"$BIN/cam" sync "$name" || true
+CLAUDE_CONFIG_DIR="$PROFILES/$name" exec claude "\$@"
+EOF
+    fi
+    chmod +x "$out"
+}
+
+cmd_add() {
+    local name="${1:-}" mode=profile
+    [[ -n "$name" ]] || die "使い方: cam add <名前> [--default]"
+    [[ "${2:-}" == --default ]] && mode=default
+    valid_name "$name"
+    [[ "$name" == cam ]] && die "cam は使えません"
+    [[ -e "$BIN/$name" ]] && die "$name はもうあります（cam list）"
+    local other
+    other=$(PATH="${PATH//$BIN:/}" command -v "$name" 2>/dev/null || true)
+    [[ -n "$other" ]] && die "$name は既存のコマンド（${other}）と同じ名前です"
+    mkdir -p "$BIN"
+    if [[ "$mode" == profile ]]; then
+        mkdir -p "$PROFILES/$name"
+        chmod 700 "$PROFILES/$name"
+        sync_profile "$name"
+    fi
+    write_launcher "$name" "$mode"
+    if [[ "$mode" == profile ]]; then
+        echo "作成: ${name}（~/.cam/profiles/${name}）"
+        echo "次に '$name' を起動し、/login でこのアカウントにログインしてください"
+    else
+        echo "作成: ${name}（~/.claude のログインで起動）"
+    fi
+}
+
+account_of() {
+    local j="$1"
+    [[ -f "$j" ]] || { echo "未ログイン"; return; }
+    jq -r '.oauthAccount.emailAddress // "未ログイン"' "$j" 2>/dev/null || echo "?"
+}
+
+cmd_list() {
+    local f name
+    shopt -s nullglob
+    for f in "$BIN"/*; do
+        name=$(basename "$f")
+        [[ "$name" == cam ]] && continue
+        if [[ -d "$PROFILES/$name" ]]; then
+            printf '%-10s %s\n' "$name" "$(account_of "$PROFILES/$name/.claude.json")"
+        else
+            printf '%-10s %s（~/.claude）\n' "$name" "$(account_of "$MASTER_JSON")"
+        fi
+    done
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "使い方: cam remove <名前>"
+    valid_name "$name"
+    [[ -e "$BIN/$name" ]] || die "$name はありません"
+    rm -f "$BIN/$name"
+    if [[ -d "$PROFILES/$name" ]]; then
+        # リンク先（~/.claude）は消さない。プロファイル内の実体だけ消える
+        rm -rf "${PROFILES:?}/$name"
+        echo "削除: ${name}（Keychain に残るこのプロファイルのログイン情報は消していません）"
+    else
+        echo "削除: $name"
+    fi
+}
+
+case "${1:-}" in
+    add) shift; cmd_add "$@" ;;
+    list|ls) cmd_list ;;
+    sync) shift; [[ -n "${1:-}" ]] || die "使い方: cam sync <名前>"; sync_profile "$1" ;;
+    remove|rm) shift; cmd_remove "$@" ;;
+    *) cat <<EOF
+cam: Claude Code をアカウントごとのコマンドで起動する
+  cam add <名前>            プロファイルを作って <名前> コマンドを作る（初回に /login）
+  cam add <名前> --default  ~/.claude のログインで起動する <名前> コマンドを作る
+  cam list                  コマンドとログイン中のアカウント
+  cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
+  cam remove <名前>         コマンドとプロファイルを消す
+EOF
+    ;;
+esac
