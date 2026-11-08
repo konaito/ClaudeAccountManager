@@ -236,6 +236,52 @@ best_of() {
     awk 'NF >= 3 && $2 < 100 && $3 < 100' | sort -k2,2g -k3,3g | head -n1 | awk '{print $1}'
 }
 
+print_usage_rows() {
+    local name five seven r5 r7
+    while read -r name five seven r5 r7; do
+        if [[ -z "$five" ]]; then
+            printf '  %-10s 不明（トークンが無いか期限切れ。一度 %s を起動すると更新される）\n' "$name" "$name"
+            continue
+        fi
+        printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）\n' \
+            "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')"
+    done
+}
+
+# メニューバーのアプリが読む JSON。使用率が取れないコマンドは five_hour などが null になる。
+usage_json() {
+    local rows="$1" best="$2" name five seven r5 r7 email
+    while read -r name five seven r5 r7; do
+        [[ -n "$name" ]] || continue
+        if [[ -d "$PROFILES/$name" ]]; then
+            email=$(account_of "$PROFILES/$name/.claude.json")
+        else
+            email=$(account_of "$MASTER_JSON")
+        fi
+        jq -n --arg name "$name" --arg email "$email" \
+            --arg five "$five" --arg seven "$seven" --arg r5 "$r5" --arg r7 "$r7" \
+            'def num: if . == "" then null else tonumber end;
+             def at: if . == "" or . == "0" then null else tonumber end;
+             {name: $name, email: $email,
+              five_hour: ($five | num), seven_day: ($seven | num),
+              five_hour_resets_at: ($r5 | at), seven_day_resets_at: ($r7 | at)}'
+    done <<<"$rows" | jq -s --arg best "$best" --argjson now "$(date +%s)" \
+        '{best: (if $best == "" then null else $best end), fetched_at: $now, accounts: .}'
+}
+
+cmd_usage() {
+    local rows best
+    rows=$(collect_usage)
+    best=$(best_of <<<"$rows")
+    if [[ "${1:-}" == --json ]]; then
+        usage_json "$rows" "$best"
+        return 0
+    fi
+    [[ -n "$rows" ]] || die "コマンドがありません（cam add）"
+    print_usage_rows <<<"$rows"
+    echo "cam auto: ${best:-（判定できない）}"
+}
+
 # 5時間枠の使用率がいちばん低いコマンドで、何も表示せずに起動する。
 cmd_auto() {
     local rows best
@@ -252,6 +298,7 @@ cmd_auto() {
 case "${1:-}" in
     add) shift; cmd_add "$@" ;;
     auto) shift; cmd_auto "$@" ;;
+    usage) shift; cmd_usage "$@" ;;
     list|ls) cmd_list ;;
     sync) shift; [[ -n "${1:-}" ]] || die "使い方: cam sync <名前>"; sync_profile "$1" ;;
     remove|rm) shift; cmd_remove "$@" ;;
@@ -263,6 +310,7 @@ cam: Claude Code をアカウントごとのコマンドで起動する
   cam add <名前> --no-login 作るだけでログインと起動はしない
   cam list                  コマンドとログイン中のアカウント
   cam auto [引数]           5時間枠の使用率がいちばん低いコマンドで起動する
+  cam usage [--json]        各コマンドの使用率と、cam auto が選ぶコマンド
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
   cam remove <名前>         コマンドとプロファイルを消す
 EOF

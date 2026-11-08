@@ -45,6 +45,7 @@ ceo                    # 2回目からはコマンドだけで起動する
 cam add coo --default  # ~/.claude のログインで起動する coo コマンドを作る
 cam list               # コマンドとログイン中のアカウント
 cam auto               # 5時間枠の使用率がいちばん低いコマンドで起動する
+cam usage              # 各コマンドの使用率と、cam auto が選ぶコマンド（--json でメニューバー用）
 cam sync ceo           # 共有リンクと MCP を同期する（起動時にも自動で行う）
 cam remove ceo         # コマンドとプロファイルを消す
 ```
@@ -64,6 +65,16 @@ cam remove ceo         # コマンドとプロファイルを消す
 - 使用率が取れないコマンドは候補から外します。全部取れないときは `--default` のコマンドで起動します
 
 使用率は、Claude Code が Keychain に保存したログインのトークンで `https://api.anthropic.com/api/oauth/usage` を呼んで取ります。この API は公開されていないので、仕様が変わると `cam auto` だけ動かなくなります。トークンの期限が切れているコマンドは、一度そのコマンドを起動すると Claude Code が更新します。
+
+## メニューバー
+
+`menubar/` の CamBar は、`cam usage --json` の結果をメニューバーに出すアプリです。メニューバーには `cam auto` が選ぶコマンドとその5時間枠の使用率を出し、開くと各コマンドの5時間枠と週次の使用率、リセット時刻を出します。アカウントの切り替えはしません。
+
+```bash
+menubar/install.sh   # ビルドして ~/Applications/CamBar.app に置き、ログイン時に起動するようにする
+```
+
+使用率は5分ごとに取り直します。ログイン時の起動には `~/Library/LaunchAgents/jp.fybe.cam.menubar.plist` を使います。
 
 ## 注意
 
