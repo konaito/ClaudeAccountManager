@@ -75,10 +75,32 @@ EOF
     chmod +x "$out"
 }
 
+# プロファイルで claude auth login を実行し、通ったら claude を起動する
+login_and_launch() {
+    local name="$1"
+    [[ -d "$PROFILES/$name" ]] || die "プロファイルがありません: ${name}（--default のコマンドは ~/.claude のログインを使う）"
+    if ! [[ -t 0 && -t 1 ]]; then
+        echo "端末から '$name' を起動し、/login でこのアカウントにログインしてください"
+        return 0
+    fi
+    echo "${name} のアカウントでログインします（ブラウザが開きます）"
+    if ! CLAUDE_CONFIG_DIR="$PROFILES/$name" claude auth login; then
+        die "ログインできませんでした。'cam login $name' でやり直すか、'$name' を起動して /login してください"
+    fi
+    exec "$BIN/$name"
+}
+
 cmd_add() {
-    local name="${1:-}" mode=profile
-    [[ -n "$name" ]] || die "使い方: cam add <名前> [--default]"
-    [[ "${2:-}" == --default ]] && mode=default
+    local name="" mode=profile login=1 a
+    for a in "$@"; do
+        case "$a" in
+            --default) mode=default ;;
+            --no-login) login=0 ;;
+            -*) die "知らないオプションです: $a" ;;
+            *) [[ -z "$name" ]] || die "使い方: cam add <名前> [--default] [--no-login]"; name="$a" ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "使い方: cam add <名前> [--default] [--no-login]"
     valid_name "$name"
     [[ "$name" == cam ]] && die "cam は使えません"
     [[ -e "$BIN/$name" ]] && die "$name はもうあります（cam list）"
@@ -94,7 +116,11 @@ cmd_add() {
     write_launcher "$name" "$mode"
     if [[ "$mode" == profile ]]; then
         echo "作成: ${name}（~/.cam/profiles/${name}）"
-        echo "次に '$name' を起動し、/login でこのアカウントにログインしてください"
+        if [[ "$login" == 1 ]]; then
+            login_and_launch "$name"
+        else
+            echo "次に 'cam login $name' か、'$name' を起動して /login でログインしてください"
+        fi
     else
         echo "作成: ${name}（~/.claude のログインで起動）"
     fi
@@ -194,12 +220,15 @@ case "${1:-}" in
     add) shift; cmd_add "$@" ;;
     auto) shift; cmd_auto "$@" ;;
     list|ls) cmd_list ;;
+    login) shift; [[ -n "${1:-}" ]] || die "使い方: cam login <名前>"; valid_name "$1"; login_and_launch "$1" ;;
     sync) shift; [[ -n "${1:-}" ]] || die "使い方: cam sync <名前>"; sync_profile "$1" ;;
     remove|rm) shift; cmd_remove "$@" ;;
     *) cat <<EOF
 cam: Claude Code をアカウントごとのコマンドで起動する
-  cam add <名前>            プロファイルを作って <名前> コマンドを作る（初回に /login）
+  cam add <名前>            プロファイルと <名前> コマンドを作り、ログインして起動する
   cam add <名前> --default  ~/.claude のログインで起動する <名前> コマンドを作る
+  cam add <名前> --no-login 作るだけでログインと起動はしない
+  cam login <名前>          <名前> のアカウントでログインし直して起動する
   cam list                  コマンドとログイン中のアカウント
   cam auto [引数]           5時間枠の使用率がいちばん低いコマンドで起動する
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
