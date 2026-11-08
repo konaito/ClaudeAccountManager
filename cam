@@ -182,7 +182,8 @@ token_of() {
         | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true
 }
 
-# 5時間枠と7日枠の使用率（%）を「5h 7d」で出す。取れなければ何も出さない。
+# 5時間枠と7日枠の使用率（%）とリセット時刻（epoch 秒、不明は 0）を
+# 「5h 7d 5hのリセット 7dのリセット」で出す。取れなければ何も出さない。
 # /api/oauth/usage は公開されていない API なので、変わったら auto だけ動かなくなる。
 usage_of() {
     local tok
@@ -190,8 +191,15 @@ usage_of() {
     [[ -n "$tok" ]] || return 0
     curl -sf -m 5 https://api.anthropic.com/api/oauth/usage \
         -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null \
-        | jq -r 'select(.five_hour.utilization != null)
-                 | "\(.five_hour.utilization) \(.seven_day.utilization // 0)"' 2>/dev/null || true
+        | jq -r 'def epoch: try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch 0;
+                 select(.five_hour.utilization != null)
+                 | "\(.five_hour.utilization) \(.seven_day.utilization // 0)"
+                   + " \(.five_hour.resets_at | epoch) \(.seven_day.resets_at | epoch)"' 2>/dev/null || true
+}
+
+# リセット時刻（epoch 秒）をこの Mac の時刻で出す。不明なら「?」
+until_of() {
+    if [[ "${1:-0}" -gt 0 ]]; then date -r "$1" "+$2"; else echo '?'; fi
 }
 
 # 5時間枠の使用率がいちばん低いコマンドで起動する。同じなら7日枠の低いほう。
@@ -211,8 +219,9 @@ cmd_auto() {
             printf '  %-10s 不明（トークンが無いか期限切れ。一度 %s を起動すると更新される）\n' "$name" "$name" >&2
             continue
         fi
-        read -r five seven <<<"$u"
-        printf '  %-10s 5h %5.1f%%  7d %5.1f%%\n' "$name" "$five" "$seven" >&2
+        read -r five seven r5 r7 <<<"$u"
+        printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）\n' \
+            "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')" >&2
         rows+="$five $seven $name"$'\n'
     done
     [[ -n "$fallback" ]] || die "コマンドがありません（cam add）"
