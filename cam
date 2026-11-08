@@ -202,35 +202,49 @@ until_of() {
     if [[ "${1:-0}" -gt 0 ]]; then date -r "$1" "+$2"; else echo '?'; fi
 }
 
-# 5時間枠の使用率がいちばん低いコマンドで起動する。同じなら7日枠の低いほう。
-# どちらかの枠が 100% のコマンドは選ばない。
-cmd_auto() {
-    local f name u five seven best="" fallback="" rows=""
+# コマンドごとの使用率を「名前 5h 7d 5hのリセット 7dのリセット」で1行ずつ出す。
+# 取れないコマンドは名前だけの行になる。API は全コマンド同時に呼び、並びはコマンド順に戻す。
+collect_usage() {
+    local f name tmp i=0 j
+    tmp=$(mktemp -d)
     shopt -s nullglob
     for f in "$BIN"/*; do
         name=$(basename "$f")
         [[ "$name" == cam ]] && continue
-        # 判定できないときの行き先: --default のコマンド、無ければ最初のコマンド
+        i=$((i + 1))
+        echo "$name $(usage_of "$name")" >"$tmp/$i" &
+    done
+    wait
+    for ((j = 1; j <= i; j++)); do cat "$tmp/$j"; done
+    rm -rf "$tmp"
+}
+
+# 判定できないときの行き先: --default のコマンド、無ければ最初のコマンド
+fallback_of() {
+    local name fallback=""
+    while read -r name _; do
         if [[ -z "$fallback" ]] || [[ -d "$PROFILES/$fallback" && ! -d "$PROFILES/$name" ]]; then
             fallback="$name"
         fi
-        u=$(usage_of "$name")
-        if [[ -z "$u" ]]; then
-            printf '  %-10s 不明（トークンが無いか期限切れ。一度 %s を起動すると更新される）\n' "$name" "$name" >&2
-            continue
-        fi
-        read -r five seven r5 r7 <<<"$u"
-        printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）\n' \
-            "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')" >&2
-        rows+="$five $seven $name"$'\n'
     done
-    [[ -n "$fallback" ]] || die "コマンドがありません（cam add）"
-    best=$(printf '%s' "$rows" | awk '$1 < 100 && $2 < 100' | sort -k1,1g -k2,2g | head -n1 | awk '{print $3}')
+    echo "$fallback"
+}
+
+# 5時間枠の使用率がいちばん低いコマンド。同じなら7日枠の低いほう。
+# どちらかの枠が 100% のコマンドと、使用率が取れないコマンドは選ばない。
+best_of() {
+    awk 'NF >= 3 && $2 < 100 && $3 < 100' | sort -k2,2g -k3,3g | head -n1 | awk '{print $1}'
+}
+
+# 5時間枠の使用率がいちばん低いコマンドで、何も表示せずに起動する。
+cmd_auto() {
+    local rows best
+    rows=$(collect_usage)
+    [[ -n "$rows" ]] || die "コマンドがありません（cam add）"
+    best=$(best_of <<<"$rows")
     if [[ -z "$best" ]]; then
-        best="$fallback"
+        best=$(fallback_of <<<"$rows")
         echo "cam: 使えるアカウントが判定できないので $best で起動します" >&2
-    else
-        echo "cam: $best で起動します" >&2
     fi
     exec "$BIN/$best" "$@"
 }
