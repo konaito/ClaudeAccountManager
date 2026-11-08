@@ -20,6 +20,8 @@ Claude Code が起動後に作るフォルダ（`sessions`、`session-env`、`te
 
 ユーザーの MCP サーバーは、起動のたびに `~/.claude.json` の `mcpServers` をプロファイル側へ写します。
 
+フォルダを開いたときの「Yes, I trust this folder」の記録は `.claude.json` に入るので、そのままではアカウントごとに聞かれます。cam は起動のたびに、`~/.claude.json` と全プロファイルの `.claude.json` から信頼済みのフォルダを集め、起動するプロファイルの `.claude.json` に写します。どれか1つのアカウントで信頼したフォルダは、次に別のアカウントを cam で起動したときには聞かれません。`--default` で作ったコマンド（`~/.claude`）の `~/.claude.json` には書き込みません。
+
 ## 置き場所
 
 - このリポジトリ: `cam` 本体

@@ -3,7 +3,7 @@
 # 1つの Mac で Claude Code をアカウントごとのコマンド（ceo, cto ...）で並べて起動する。
 # 公式の CLAUDE_CONFIG_DIR を使う。ログイン（Keychain）だけ別で、
 # ~/.claude の中身はアカウントごとの値を除いて全部リンクで共有し、
-# ユーザー MCP（~/.claude.json の mcpServers）は起動のたびに同期する。
+# ユーザー MCP（~/.claude.json の mcpServers）と信頼済みフォルダは起動のたびに同期する。
 # 共有リストは Nael-Nathanael/ccd（MIT）を参考にした。
 set -euo pipefail
 
@@ -15,7 +15,7 @@ BIN="$CAM_HOME/bin"
 
 # ~/.claude の中身は、下の PER_ACCOUNT に当たるもの以外を全部リンクで共有する。
 # sessions も共有するので、どのアカウントのセッションからも ListAgents と SendMessage で互いが見える。
-# アカウントごとに分けるもの: ログイン（Keychain）、.claude.json（プロファイル直下。mcpServers だけ同期）、
+# アカウントごとに分けるもの: ログイン（Keychain）、.claude.json（プロファイル直下。mcpServers と信頼済みフォルダだけ同期）、
 # 組織ごとの値（policy-limits.json・remote-settings.json）、MCP の認証状態、.claude.json の控え（backups）。
 PER_ACCOUNT=(.claude.json .credentials.json .credentials.lock mcp-needs-auth-cache.json backups
              'policy-limits.json*' 'remote-settings.json*' '*.bak' '*.bak-*' '*.tmp.*' .DS_Store)
@@ -63,7 +63,7 @@ adopt() {
     echo "cam: $(basename "$dir")/$f を ~/.claude/$f へのリンクにしました" >&2
 }
 
-# プロファイルの共有リンクを張り直し、mcpServers を同期する
+# プロファイルの共有リンクを張り直し、mcpServers と信頼済みフォルダを同期する
 sync_profile() {
     local name="$1" dir="$PROFILES/$1" f d
     [[ -d "$dir" ]] || die "プロファイルがありません: $name"
@@ -84,19 +84,40 @@ sync_profile() {
             ln -s "$MASTER/$f" "$dir/$f"
         fi
     done
-    [[ -f "$MASTER_JSON" ]] || return 0
-    local pj="$dir/.claude.json" want have tmp
-    want=$(jq -c '.mcpServers // {}' "$MASTER_JSON")
-    if [[ -f "$pj" ]]; then
-        have=$(jq -c '.mcpServers // {}' "$pj" 2>/dev/null || echo invalid)
-        [[ "$have" == "$want" ]] && return 0
-        [[ "$have" == invalid ]] && { echo "cam: $pj を読めないので MCP は同期しません" >&2; return 0; }
-        tmp=$(mktemp "$dir/.claude.json.cam.XXXXXX")
-        jq --argjson m "$want" '.mcpServers = $m' "$pj" >"$tmp"
+    sync_claude_json "$dir"
+}
+
+# 信頼済みのフォルダ（.claude.json の projects[パス].hasTrustDialogAccepted）を、
+# ~/.claude.json と全プロファイルから集めて重複を除き、JSON の配列で出す。読めないファイルは飛ばす。
+trusted_dirs() {
+    local f
+    for f in "$MASTER_JSON" "$PROFILES"/*/.claude.json; do
+        [[ -f "$f" ]] || continue
+        jq -c '[.projects // {} | to_entries[] | select(.value.hasTrustDialogAccepted == true) | .key]' "$f" 2>/dev/null || true
+    done | jq -sc 'add // [] | unique'
+}
+
+# プロファイルの .claude.json に、~/.claude.json の mcpServers と、
+# どれかのアカウントで信頼したフォルダを写す。変わるときだけ書き換える。
+sync_claude_json() {
+    local dir="$1" pj="$1/.claude.json" mcp trusted cur new tmp
+    if [[ -f "$MASTER_JSON" ]]; then
+        mcp=$(jq -c '.mcpServers // {}' "$MASTER_JSON" 2>/dev/null) || mcp=null
     else
-        tmp=$(mktemp "$dir/.claude.json.cam.XXXXXX")
-        jq -n --argjson m "$want" '{mcpServers: $m}' >"$tmp"
+        mcp=null
     fi
+    trusted=$(trusted_dirs)
+    if [[ -f "$pj" ]]; then
+        cur=$(jq -c . "$pj" 2>/dev/null) || { echo "cam: $pj を読めないので MCP と信頼済みフォルダは同期しません" >&2; return 0; }
+    else
+        cur='{}'
+    fi
+    new=$(jq -c --argjson m "$mcp" --argjson t "$trusted" '
+        (if $m == null then . else .mcpServers = $m end)
+        | reduce $t[] as $p (.; .projects[$p].hasTrustDialogAccepted = true)' <<<"$cur")
+    [[ "$new" == "$cur" && -f "$pj" ]] && return 0
+    tmp=$(mktemp "$dir/.claude.json.cam.XXXXXX")
+    jq . <<<"$new" >"$tmp"
     chmod 600 "$tmp"
     mv "$tmp" "$pj"
 }
