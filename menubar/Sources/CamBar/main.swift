@@ -7,6 +7,10 @@ import SwiftUI
 struct Account: Decodable, Identifiable {
     let name: String
     let email: String
+    // ok・cached（API に断られ、前回の値を使っている）・limited・notoken・error。古い cam には無い
+    let status: String?
+    let reason: String?
+    let as_of: Double?
     let five_hour: Double?
     let seven_day: Double?
     let five_hour_resets_at: Double?
@@ -58,6 +62,12 @@ func color(_ v: Double?) -> Color {
     if v >= 100 { return .red }
     if v >= 80 { return .orange }
     return .primary
+}
+
+func clockText(_ epoch: Double) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "H:mm"
+    return f.string(from: Date(timeIntervalSince1970: epoch))
 }
 
 func resetText(_ epoch: Double?, _ format: String) -> String {
@@ -112,10 +122,13 @@ struct UsageView: View {
                 // cam auto が選ぶコマンドには * を付ける
                 Text(best ? "*\(a.name)" : a.name).font(.system(size: 13))
                 Text(a.email).font(.system(size: 10)).foregroundStyle(.secondary)
+                if a.status == "cached", let asOf = a.as_of {
+                    Text(clockText(asOf) + " 時点の値").font(.system(size: 10)).foregroundStyle(.orange)
+                }
             }
             if a.five_hour == nil {
                 Text("不明").foregroundStyle(.secondary)
-                Text("一度 \(a.name) を起動すると直る").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(a.reason ?? "一度 \(a.name) を起動すると直る").font(.system(size: 10)).foregroundStyle(.secondary)
                     .gridCellColumns(3)
             } else {
                 Text(percent(a.five_hour)).foregroundStyle(color(a.five_hour))
