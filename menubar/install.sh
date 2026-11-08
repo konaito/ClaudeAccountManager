@@ -38,4 +38,4 @@ EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "入れた: $APP（ログイン時に起動）"
+echo "入れた: ${APP}（ログイン時に起動）"
