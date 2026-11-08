@@ -75,8 +75,6 @@ struct UsageView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let usage {
-                Text(usage.best.map { "cam auto → \($0)" } ?? "cam auto が選べるコマンドがない")
-                    .font(.system(size: 12, weight: .semibold))
                 Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
                     GridRow {
                         Text("")
@@ -111,7 +109,8 @@ struct UsageView: View {
     func row(_ a: Account, best: Bool) -> some View {
         GridRow {
             VStack(alignment: .leading, spacing: 1) {
-                Text(a.name).font(.system(size: 13, weight: best ? .bold : .regular))
+                // cam auto が選ぶコマンドには * を付ける
+                Text(best ? "*\(a.name)" : a.name).font(.system(size: 13))
                 Text(a.email).font(.system(size: 10)).foregroundStyle(.secondary)
             }
             if a.five_hour == nil {
