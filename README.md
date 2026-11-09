@@ -1,4 +1,4 @@
-# cam
+# Claude Account Manager (cam)
 
 cam は、1台の Mac で Claude Code をアカウントごとのコマンドで起動するための bash スクリプトです。`ceo` と打つと ceo@fybe.jp で、`claude` と打つと既定のアカウントで起動し、2つは別のターミナルで同時に動かせます。
 
