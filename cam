@@ -22,6 +22,17 @@ PER_ACCOUNT=(.claude.json .credentials.json .credentials.lock mcp-needs-auth-cac
 # Claude Code が起動後に作るフォルダ。~/.claude に先に作っておき、プロファイルに実体ができる前にリンクを張る。
 RUNTIME_DIRS=(sessions session-env shell-snapshots teams tasks todos jobs ide debug paste-cache telemetry cache)
 
+# cam auto の選び方の定数（README「cam auto の選び方」）。
+# 保護枠 R = RESERVE_RATE × min(1, 7日枠のリセットまでの時間 / RESERVE_HOURS)
+# スコア = WEEKLY_WEIGHT × ΔW / (W − R) + ΔH / H（W・H は残量 0〜1。小さいほうを選ぶ）
+RESERVE_RATE=0.15
+RESERVE_HOURS=24
+WEEKLY_WEIGHT=3
+# ΔH・ΔW は次の作業で使う5時間枠・7日枠の量（0〜1）。仮置き。
+# 実測していないので、全コマンド共通の控えめな値を置いている。
+EST_FIVE=0.10
+EST_WEEK=0.02
+
 die() { echo "cam: $*" >&2; exit 1; }
 
 valid_name() {
@@ -308,8 +319,13 @@ until_of() {
 
 # コマンドごとの使用率を usage_row の形で1行ずつ出す。
 # API は全コマンド同時に呼び、並びはコマンド順に戻す。
+# CAM_TEST_USAGE にファイルを渡すと、API と控えを使わずにその中身を返す（選び方を試す用）。
 collect_usage() {
     local f name tmp i=0 j
+    if [[ -n "${CAM_TEST_USAGE:-}" ]]; then
+        cat "$CAM_TEST_USAGE"
+        return 0
+    fi
     tmp=$(mktemp -d)
     shopt -s nullglob
     for f in "$BIN"/*; do
@@ -334,11 +350,55 @@ fallback_of() {
     echo "$fallback"
 }
 
-# 5時間枠の使用率がいちばん低いコマンド。同じなら7日枠の低いほう。
-# どちらかの枠が 100% のコマンドと、使用率が取れず控えも無いコマンドは選ばない。
-# 控え（cached）の値も、取れた値と同じに扱う。
-best_of() {
-    awk '($2 == "ok" || $2 == "cached") && $3 < 100 && $4 < 100' | sort -k3,3g -k4,4g | head -n1 | awk '{print $1}'
+# cam auto が選ぶコマンドを、7日枠（Weekly）の保護枠を残す方式で決める。
+# 入力は collect_usage の行。出力は1行で、次のどれか。
+#   normal <名前>          通常候補（使った後も保護枠を残せる）からスコア最小
+#   fallback <名前>        通常候補が無いので、保護枠を使ってよい候補から選んだ
+#   none <名前> <時刻>     値の分かる全コマンドが上限。<名前> がいちばん早く戻る（epoch 秒）
+#   none - 0               上限で、戻る時刻も分からない
+#   unknown                使えるコマンドが無く、使用率の分からないコマンドがある
+# 使える: 5時間枠も7日枠も 100% 未満。使用率が取れず控えも無いコマンドは候補にしない。
+# 控え（cached）の値も、取れた値と同じに扱う。同じスコアならコマンド順で先のほう。
+# CAM_TEST_NOW で今の時刻（epoch 秒）を差し替えられる（選び方を試す用）。
+choose_of() {
+    awk -v now="${CAM_TEST_NOW:-$(date +%s)}" -v rr="$RESERVE_RATE" -v rh="$RESERVE_HOURS" \
+        -v ww="$WEEKLY_WEIGHT" -v dh="$EST_FIVE" -v dw="$EST_WEEK" '
+        $2 != "ok" && $2 != "cached" { unknown = 1; next }
+        $3 >= 100 || $4 >= 100 {
+            # 上限の枠のリセットのうち遅いほうで戻る。リセット時刻が分からない枠があれば数えない
+            t = 0; bad = 0
+            if ($3 >= 100) { if ($5 > 0) t = $5; else bad = 1 }
+            if ($4 >= 100) { if ($6 > 0) { if ($6 > t) t = $6 } else bad = 1 }
+            if (!bad && (rname == "" || t < rat)) { rname = $1; rat = t }
+            next
+        }
+        {
+            h = 1 - $3 / 100; w = 1 - $4 / 100
+            # 7日枠のリセット時刻が分からないときは、保護枠をいちばん大きくする
+            tw = ($6 > 0) ? ($6 - now) / 3600 : rh
+            if (tw < 0) tw = 0
+            f = tw / rh; if (f > 1) f = 1
+            r = rr * f
+            if (h >= dh && w - dw >= r) {
+                d = w - r; if (d < 1e-6) d = 1e-6
+                s = ww * dw / d + dh / h
+                if (nname == "" || s < ns) { nname = $1; ns = s }
+            } else {
+                # 保護枠を使う候補。W − R が 0 以下になりうるので、分母を W にしたスコアにする。
+                # 先に、次の作業ぶんが残っているもの（H ≥ ΔH かつ W ≥ ΔW）を選ぶ。
+                # 次に、すでに保護枠を割っているもの（W < R）を選ぶ。保護枠を残しているコマンドの数を減らさないため
+                k = ((h >= dh && w >= dw) ? 0 : 2) + ((w >= r) ? 1 : 0)
+                s = ww * dw / w + dh / h
+                if (fname == "" || k < fk || (k == fk && s < fs)) { fname = $1; fk = k; fs = s }
+            }
+        }
+        END {
+            if (nname != "") print "normal", nname
+            else if (fname != "") print "fallback", fname
+            else if (unknown) print "unknown"
+            else if (rname != "") print "none", rname, rat
+            else print "none - 0"
+        }'
 }
 
 # 使用率が取れないときの理由
@@ -368,8 +428,11 @@ print_usage_rows() {
 # メニューバーのアプリが読む JSON。
 # status は ok・cached・limited・notoken・error。as_of は値を取った時刻（epoch 秒）。
 # 使用率が取れず控えも無いコマンドは five_hour などが null になる。
+# best は cam auto が選ぶコマンドで、選べないときは null。
+# choice は choose_of の結果（normal・fallback・none・unknown）。
+# next_available は choice が none のとき、いちばん早く戻るコマンドとその時刻（分からなければ null）。
 usage_json() {
-    local rows="$1" best="$2" name st five seven r5 r7 at email
+    local rows="$1" mode="$2" best="$3" next_at="$4" name st five seven r5 r7 at email
     while read -r name st five seven r5 r7 at; do
         [[ -n "$name" ]] || continue
         if [[ -d "$PROFILES/$name" ]]; then
@@ -386,34 +449,62 @@ usage_json() {
               as_of: ($at | at),
               five_hour: ($five | num), seven_day: ($seven | num),
               five_hour_resets_at: ($r5 | at), seven_day_resets_at: ($r7 | at)}'
-    done <<<"$rows" | jq -s --arg best "$best" --argjson now "$(date +%s)" \
-        '{best: (if $best == "" then null else $best end), fetched_at: $now, accounts: .}'
+    done <<<"$rows" | jq -s --arg mode "$mode" --arg best "$best" --arg next_at "${next_at:-0}" \
+        --argjson now "$(date +%s)" \
+        '{best: (if ($mode == "normal" or $mode == "fallback") and $best != "" then $best else null end),
+          choice: $mode,
+          next_available: (if $mode == "none" and $best != "-" and $best != ""
+                           then {name: $best, at: ($next_at | tonumber)} else null end),
+          fetched_at: $now, accounts: .}'
+}
+
+# 戻る時刻の一言。choose_of の none の行から作る
+next_text() {
+    if [[ "$1" == - || -z "$1" ]]; then
+        echo "戻る時刻は分からない"
+    else
+        echo "いちばん早く戻るのは $1（$(date -r "$2" '+%-m/%-d %H:%M')）"
+    fi
 }
 
 cmd_usage() {
-    local rows best
+    local rows mode best next_at
     rows=$(collect_usage)
-    best=$(best_of <<<"$rows")
+    read -r mode best next_at <<<"$(choose_of <<<"$rows")"
     if [[ "${1:-}" == --json ]]; then
-        usage_json "$rows" "$best"
+        usage_json "$rows" "$mode" "$best" "$next_at"
         return 0
     fi
     [[ -n "$rows" ]] || die "コマンドがありません（cam add）"
     print_usage_rows <<<"$rows"
-    echo "cam auto: ${best:-（判定できない）}"
+    case "$mode" in
+        normal) echo "cam auto: $best" ;;
+        fallback) echo "cam auto: ${best}（7日枠の保護枠を残せるコマンドが無いので、保護枠を使う）" ;;
+        none) echo "cam auto: 使えるコマンドなし。$(next_text "$best" "$next_at")" ;;
+        *) echo "cam auto: （判定できない）" ;;
+    esac
 }
 
-# 5時間枠の使用率がいちばん低いコマンドで、何も表示せずに起動する。
+# 7日枠の保護枠を残す方式で選んだコマンドを、何も表示せずに起動する。
+# 保護枠を使うときは1行だけ知らせる。全コマンドが上限なら起動しない。
 cmd_auto() {
-    local rows best
+    local rows mode best next_at
     rows=$(collect_usage)
     [[ -n "$rows" ]] || die "コマンドがありません（cam add）"
-    best=$(best_of <<<"$rows")
-    if [[ -z "$best" ]]; then
-        best=$(fallback_of <<<"$rows")
-        echo "cam: 使えるアカウントが判定できないので $best で起動します" >&2
-        print_usage_rows <<<"$rows" >&2
-    fi
+    read -r mode best next_at <<<"$(choose_of <<<"$rows")"
+    case "$mode" in
+        normal) ;;
+        fallback)
+            echo "cam: 7日枠の保護枠を残せるコマンドが無いので、保護枠を使って $best で起動します" >&2 ;;
+        none)
+            echo "cam: 使えるコマンドがありません。$(next_text "$best" "$next_at")" >&2
+            print_usage_rows <<<"$rows" >&2
+            exit 1 ;;
+        *)
+            best=$(fallback_of <<<"$rows")
+            echo "cam: 使えるアカウントが判定できないので $best で起動します" >&2
+            print_usage_rows <<<"$rows" >&2 ;;
+    esac
     exec "$BIN/$best" "$@"
 }
 
@@ -431,7 +522,7 @@ cam: Claude Code をアカウントごとのコマンドで起動する
   cam add <名前> --default  ~/.claude のログインで起動する <名前> コマンドを作る
   cam add <名前> --no-login 作るだけでログインと起動はしない
   cam list                  コマンドとログイン中のアカウント
-  cam auto [引数]           5時間枠の使用率がいちばん低いコマンドで起動する
+  cam auto [引数]           7日枠の保護枠を残せるコマンドから選んで起動する
   cam usage [--json]        各コマンドの使用率と、cam auto が選ぶコマンド
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
   cam remove <名前>         コマンドとプロファイルを消す
