@@ -54,11 +54,18 @@ per_account() {
 # プロファイルの <名前> を ~/.claude/<名前> へのリンクにする。
 # -n を付けないと、別の sync が先に張ったフォルダへのリンクを ln がたどり、
 # ~/.claude/<名前>/<名前> -> ~/.claude/<名前> という自分自身を指すリンクを作る。
-# 先を越されたとき（リンクができている、または Claude Code が実体を作った）は張らずに戻る。実体は次の sync で取り込む。
+# -n を付けても、確認の後に Claude Code が実体のフォルダを作っていると、ln はその中にリンクを作る。
+# そのときは中にできたリンクを消して戻る。実体は次の sync で取り込む。
 link_master() {
     local dir="$1" f="$2"
-    ln -sn "$MASTER/$f" "$dir/$f" 2>/dev/null && return 0
-    [[ -L "$dir/$f" ]] && return 0
+    if ln -sn "$MASTER/$f" "$dir/$f" 2>/dev/null; then
+        [[ -L "$dir/$f" ]] && return 0
+        if [[ -L "$dir/$f/$f" && "$(readlink "$dir/$f/$f")" == "$MASTER/$f" ]]; then
+            rm -f "$dir/$f/$f"
+        fi
+    elif [[ -L "$dir/$f" ]]; then
+        return 0
+    fi
     echo "cam: $(basename "$dir")/$f のリンクを張れませんでした（次の sync でやり直します）" >&2
     return 1
 }
