@@ -13,6 +13,9 @@ https://code.claude.com/docs/en/authentication
 - `.claude.json`（ログイン中のアカウント情報を含む）と、その控えの `backups`
 - 組織ごとの値（`policy-limits.json`、`remote-settings.json`）
 - MCP の認証状態（`mcp-needs-auth-cache.json`）
+- Claude Code が設定ディレクトリに作る lock（`*.lock` と `*.lock.*`。`.oauth_refresh.lock` とその `.owner`、`mcp-refresh-*.lock`、`computer-use.lock`、`server.lock` など）
+
+lock は Claude Code が作っては消すので、リンクで共有できません。`.oauth_refresh.lock` がリンクだと、Claude Code はトークン更新の lock を外せず（`ENOTDIR`）、約8時間でアクセストークンが切れて `/login` を求めます。`cam sync` は、前の版の cam がこれらの名前で張ったリンク（`~/.claude` を指すもの）を消します。実体のファイルやフォルダは消しません。
 
 それ以外の `~/.claude` の中身は、全部シンボリックリンクで共通にします。設定、スキル、会話履歴に加えて、`sessions` も共通です。そのため、どのアカウントで起動したセッションからも、`ListAgents` と `SendMessage` でほかのセッションが見えます。
 
