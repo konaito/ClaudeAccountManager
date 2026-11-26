@@ -35,6 +35,9 @@ WEEKLY_WEIGHT=3
 # 実測していないので、全コマンド共通の控えめな値を置いている。
 EST_FIVE=0.10
 EST_WEEK=0.02
+# 控え（usage-cache）を cam auto の判定に使う期限（秒）。5時間枠の長さと同じ。
+# これより前に取った控えは、5時間枠がまるごと入れ替わっているかもしれないので使わない（issue #14）。
+STALE_SECONDS=18000
 
 die() { echo "cam: $*" >&2; exit 1; }
 
@@ -300,13 +303,20 @@ cmd_remove() {
 
 # Claude Code がそのコマンドのログインを置く Keychain の項目から OAuth のアクセストークンを読む。
 # CLAUDE_CONFIG_DIR を付けると項目名に sha256(パス) の先頭8桁が付く（ceo で確認）。
+# 同じ項目名で acct の違う項目が2つできることがある（ceo で、acct=unknown に mcpOAuth だけを持つ項目があった。issue #14）。
+# acct を指定しないと security はそちらを返すことがあるので、先に acct=$USER を読み、トークンが無ければ acct なしで読む。
 token_of() {
-    local name="$1" svc="Claude Code-credentials"
+    local name="$1" svc="Claude Code-credentials" tok
     if [[ -d "$PROFILES/$name" ]]; then
         svc+="-$(printf %s "$PROFILES/$name" | shasum -a 256 | cut -c1-8)"
     fi
-    security find-generic-password -s "$svc" -w 2>/dev/null \
-        | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true
+    tok=$(security find-generic-password -s "$svc" -a "$USER" -w 2>/dev/null \
+        | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
+    if [[ -z "$tok" ]]; then
+        tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+            | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
+    fi
+    echo "$tok"
 }
 
 # 使用率を API から取り、「状態 5h 7d 5hのリセット 7dのリセット」で出す。
@@ -408,12 +418,14 @@ fallback_of() {
 #   none - 0               上限で、戻る時刻も分からない
 #   unknown                使えるコマンドが無く、使用率の分からないコマンドがある
 # 使える: 5時間枠も7日枠も 100% 未満。使用率が取れず控えも無いコマンドは候補にしない。
-# 控え（cached）の値も、取れた値と同じに扱う。同じスコアならコマンド順で先のほう。
+# 控え（cached）の値は、取った時刻が STALE_SECONDS 以内なら取れた値と同じに扱い、それより古ければ
+# 使用率の分からないコマンドとして扱う。同じスコアならコマンド順で先のほう。
 # CAM_TEST_NOW で今の時刻（epoch 秒）を差し替えられる（選び方を試す用）。
 choose_of() {
     awk -v now="${CAM_TEST_NOW:-$(date +%s)}" -v rr="$RESERVE_RATE" -v rh="$RESERVE_HOURS" \
-        -v ww="$WEEKLY_WEIGHT" -v dh="$EST_FIVE" -v dw="$EST_WEEK" '
+        -v ww="$WEEKLY_WEIGHT" -v dh="$EST_FIVE" -v dw="$EST_WEEK" -v stale="$STALE_SECONDS" '
         $2 != "ok" && $2 != "cached" { unknown = 1; next }
+        $2 == "cached" && now - $7 > stale { unknown = 1; next }
         $3 >= 100 || $4 >= 100 {
             # 上限の枠のリセットのうち遅いほうで戻る。リセット時刻が分からない枠があれば数えない
             t = 0; bad = 0
@@ -463,7 +475,8 @@ reason_of() {
 }
 
 print_usage_rows() {
-    local name st five seven r5 r7 at note
+    local name st five seven r5 r7 at note now
+    now=${CAM_TEST_NOW:-$(date +%s)}
     while read -r name st five seven r5 r7 at; do
         [[ -n "$name" ]] || continue
         if [[ "$st" != ok && "$st" != cached ]]; then
@@ -471,7 +484,10 @@ print_usage_rows() {
             continue
         fi
         note=""
-        [[ "$st" == cached ]] && note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+        if [[ "$st" == cached ]]; then
+            note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+            (( now - at > STALE_SECONDS )) && note+="。5時間より前の値なので cam auto では使わない"
+        fi
         printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）%s\n' \
             "$name" "$five" "$(until_of "$r5" '%H:%M')" "$seven" "$(until_of "$r7" '%-m/%-d %H:%M')" "$note"
     done
