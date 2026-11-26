@@ -21,9 +21,16 @@ lock は Claude Code が作っては消すので、リンクで共有できま�
 
 Claude Code が起動後に作るフォルダ（`sessions`、`session-env`、`teams`、`tasks` など）は、`~/.claude` に先に作ってからリンクを張ります。プロファイルにすでに実体があるときは、中身を `~/.claude` に移してからリンクにします。`~/.claude` に同じ名前のものがあれば、捨てずにプロファイルの `.cam-replaced/<時刻>/` に残します。
 
-ユーザーの MCP サーバーは、起動のたびに `~/.claude.json` の `mcpServers` をプロファイル側へ写します。
+ユーザーの MCP サーバーの正本は `~/.claude.json` の `mcpServers` です。cam は起動のたびに、次の順で同期します。
 
-フォルダを開いたときの「Yes, I trust this folder」の記録は `.claude.json` に入るので、そのままではアカウントごとに聞かれます。cam は起動のたびに、`~/.claude.json` と全プロファイルの `.claude.json` から信頼済みのフォルダを集め、起動するプロファイルの `.claude.json` に写します。どれか1つのアカウントで信頼したフォルダは、次に別のアカウントを cam で起動したときには聞かれません。`--default` で作ったコマンド（`~/.claude`）の `~/.claude.json` には書き込みません。
+1. どれかのプロファイルの中で足された MCP（`claude mcp add --scope user` はプロファイルの `.claude.json` に書きます）を、`~/.claude.json` に取り込みます。同じ名前で中身が違うときは `~/.claude.json` を残します
+2. `~/.claude.json` の `mcpServers` を、ログイン済みの全プロファイルへ写します。起動するプロファイルだけでなく、ほかのプロファイルにも写します
+
+MCP を消すときは `~/.claude.json` から消します（`env -u CLAUDE_CONFIG_DIR claude mcp remove -s user <名前>`）。次の同期で全プロファイルから消えます。プロファイルの中だけで消しても、`~/.claude.json` から戻ってきます。前の同期で配った名前は `~/.cam/mcp-distributed.json` に控えます。プロファイルにだけある名前は、控えにあれば「消されたもの」として捨て、控えに無ければ「足されたもの」として取り込みます。
+
+フォルダを開いたときの「Yes, I trust this folder」の記録は `.claude.json` に入るので、そのままではアカウントごとに聞かれます。cam は起動のたびに、`~/.claude.json` と全プロファイルの `.claude.json` から信頼済みのフォルダを集め、ログイン済みの全プロファイルの `.claude.json` に写します。どれか1つのアカウントで信頼したフォルダは、次に cam でどれかのアカウントを起動したあと、どのアカウントでも聞かれません。信頼済みのフォルダについては、`--default` で作ったコマンド（`~/.claude`）の `~/.claude.json` には書き込みません。
+
+動いているセッションは、起動したときに読んだ設定のままです。同期した内容は、そのアカウントを次に起動したときに使われます。同時に起動した cam が `~/.claude.json` を書き合わないよう、同期は `~/.cam/.sync.lock` で1つずつにします。1分より古いロックは、止まった cam の残りとして消します。
 
 ## 置き場所
 
@@ -96,5 +103,6 @@ menubar/install.sh   # ビルドして ~/Applications/CamBar.app に置き、ロ
 - API キーを使わない Claude Console のサインインは、保存先が `CLAUDE_CONFIG_DIR` の外にあるので、アカウントごとに分けられません（公式ドキュメントの記述）
 - リモートの MCP サーバーは、プロファイルごとにもう一度認証が要るかもしれません（未確認）
 - `cam remove` は Keychain の項目を消しません
+- MCP と信頼済みフォルダの同期の回帰テストは `tests/mcp_sync_test.sh` です。HOME を一時ディレクトリに替えて動かします
 
 共通にするファイルの一覧は [ccd](https://github.com/Nael-Nathanael/ccd)（MIT）を参考にしました。
