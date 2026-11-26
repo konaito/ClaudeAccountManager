@@ -11,6 +11,9 @@ MASTER="$HOME/.claude"
 MASTER_JSON="$HOME/.claude.json"
 CAM_HOME="$HOME/.cam"
 PROFILES="$CAM_HOME/profiles"
+# 前の同期で大元から配った MCP の名前。プロファイルにだけある MCP が「新しく足されたもの」か
+# 「大元から消されたもの」かを、この台帳で見分ける
+MCP_LEDGER="$CAM_HOME/mcp-distributed.json"
 BIN="$CAM_HOME/bin"
 
 # ~/.claude の中身は、下の PER_ACCOUNT に当たるもの以外を全部リンクで共有する。
@@ -148,7 +151,58 @@ sync_profile() {
             link_master "$dir" "$f" || true
         fi
     done
-    sync_claude_json "$dir"
+    sync_all_claude_json "$dir"
+}
+
+# 全プロファイルの .claude.json を同期する。先にプロファイルで足された MCP を大元へ取り込み、
+# それから大元の mcpServers と信頼済みフォルダを、ログイン済み（.claude.json がある）の全プロファイルへ写す。
+# 同時に起動した cam sync が大元を書き合わないよう、mkdir のロックで1つずつにする。取れなければ写すだけにする。
+sync_all_claude_json() {
+    local self="$1" lock="$CAM_HOME/.sync.lock" i got=0 pj
+    # 前の cam が途中で止まって残したロック（1分より古いもの）は消す
+    [[ -d "$lock" && -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] && rmdir "$lock" 2>/dev/null
+    for i in $(seq 1 50); do
+        if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+        sleep 0.1
+    done
+    [[ $got == 1 ]] && adopt_profile_mcp
+    # 起動するプロファイルは .claude.json がまだ無くても作る（初めての起動）。ほかはログイン済みのものだけ
+    sync_claude_json "$self"
+    for pj in "$PROFILES"/*/.claude.json; do
+        [[ -f "$pj" && "$(dirname "$pj")" != "$self" ]] && sync_claude_json "$(dirname "$pj")"
+    done
+    [[ $got == 1 ]] && rmdir "$lock" 2>/dev/null
+    return 0
+}
+
+# プロファイルの中で足された MCP（大元に無く、台帳にも無い名前）を大元の mcpServers へ取り込む。
+# 台帳にある名前は大元から消されたものなので取り込まない。同じ名前で中身が違うときは大元を残す。
+# 大元は Claude Code（--default のコマンド）も書くので、取り込むものがあるときだけ書き換える。最後に台帳を大元の名前にそろえる。
+adopt_profile_mcp() {
+    [[ -f "$MASTER_JSON" ]] || return 0
+    local master ledger add f tmp
+    master=$(jq -c '.mcpServers // {}' "$MASTER_JSON" 2>/dev/null) || return 0
+    ledger=$(jq -c 'if type == "array" then . else [] end' "$MCP_LEDGER" 2>/dev/null) || ledger='[]'
+    add='{}'
+    for f in "$PROFILES"/*/.claude.json; do
+        [[ -f "$f" ]] || continue
+        add=$(jq -c --argjson m "$master" --argjson l "$ledger" --argjson a "$add" '
+            (.mcpServers // {}) | with_entries(select((.key as $k | $m | has($k) | not) and (.key as $k | $l | index($k) | not)))
+            | $a + . ' "$f" 2>/dev/null) || add='{}'
+    done
+    if [[ "$add" != '{}' ]]; then
+        tmp=$(mktemp "$HOME/.claude.json.cam.XXXXXX")
+        if jq --argjson a "$add" '.mcpServers = ((.mcpServers // {}) + $a)' "$MASTER_JSON" >"$tmp" && [[ -s "$tmp" ]]; then
+            chmod 600 "$tmp"
+            mv "$tmp" "$MASTER_JSON"
+            echo "cam: プロファイルで足された MCP を ~/.claude.json に取り込みました: $(jq -r 'keys | join(", ")' <<<"$add")" >&2
+        else
+            rm -f "$tmp"
+            return 0
+        fi
+    fi
+    tmp=$(mktemp "$CAM_HOME/.mcp-ledger.XXXXXX")
+    jq -c '.mcpServers // {} | keys' "$MASTER_JSON" >"$tmp" 2>/dev/null && mv "$tmp" "$MCP_LEDGER" || rm -f "$tmp"
 }
 
 # 信頼済みのフォルダ（.claude.json の projects[パス].hasTrustDialogAccepted）を、
