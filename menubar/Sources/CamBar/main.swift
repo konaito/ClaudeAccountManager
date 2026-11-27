@@ -75,6 +75,17 @@ func asOfText(_ epoch: Double, now: Date) -> String {
     return f.string(from: date)
 }
 
+// cam の STALE_SECONDS と同じ値。これより前に取った控えは、cam auto が使用率の分からないコマンドとして扱う。
+// JSON には入らないので、cam の値を変えたらここも変える
+let staleSeconds: Double = 18000
+
+// 5時間より前に取った控え。5時間枠はその後にリセットされているので、値は分からない。
+// 基準は cam が best を決めた時刻（fetched_at）にし、メニューを開いた時刻にはしない
+func isStale(_ a: Account, fetchedAt: Double) -> Bool {
+    guard a.status == "cached", let asOf = a.as_of else { return false }
+    return fetchedAt - asOf > staleSeconds
+}
+
 func resetText(_ epoch: Double?, _ format: String) -> String {
     guard let epoch else { return "" }
     let f = DateFormatter()
@@ -102,7 +113,7 @@ struct UsageView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     ForEach(usage.accounts) { a in
-                        row(a, best: a.name == usage.best)
+                        row(a, best: a.name == usage.best, stale: isStale(a, fetchedAt: usage.fetched_at))
                         // 控えの値の理由（トークンの期限切れなど）は、名前の列を広げないよう行の下に全幅で出す
                         if a.status == "cached", a.five_hour != nil, let reason = a.reason {
                             GridRow {
@@ -131,7 +142,7 @@ struct UsageView: View {
     }
 
     @ViewBuilder
-    func row(_ a: Account, best: Bool) -> some View {
+    func row(_ a: Account, best: Bool, stale: Bool) -> some View {
         GridRow {
             VStack(alignment: .leading, spacing: 1) {
                 // cam auto が選ぶコマンドには * を付ける
@@ -146,8 +157,14 @@ struct UsageView: View {
                 Text(a.reason ?? "一度 \(a.name) を起動すると直る").font(.system(size: 10)).foregroundStyle(.secondary)
                     .gridCellColumns(3)
             } else {
-                Text(percent(a.five_hour)).foregroundStyle(color(a.five_hour))
-                Text(resetText(a.five_hour_resets_at, "H:mm")).font(.system(size: 10)).foregroundStyle(.secondary)
+                // 古い控えの5時間枠は 0% と出さない（使えるように見えるため）。週次はリセット前なら意味があるので出す
+                if stale {
+                    Text("不明").foregroundStyle(.secondary)
+                    Text("")
+                } else {
+                    Text(percent(a.five_hour)).foregroundStyle(color(a.five_hour))
+                    Text(resetText(a.five_hour_resets_at, "H:mm")).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
                 Text(percent(a.seven_day)).foregroundStyle(color(a.seven_day))
                 Text(resetText(a.seven_day_resets_at, "M/d H:mm")).font(.system(size: 10)).foregroundStyle(.secondary)
             }
