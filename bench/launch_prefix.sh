@@ -3,7 +3,8 @@
 # 本物の ~/.claude.json とプロファイルの .claude.json は読んで一時 HOME に写すだけで、本物には書かない。
 # ~/.claude とプロファイルの中身は、名前と種類（ファイル、フォルダ、リンク）だけを空の実体で写す。
 # 使い方: bench/launch_prefix.sh [回数=15] [比べる版=origin/main] [名前=ceo]
-#   出力: 1行に「old|new ミリ秒」。最後に版ごとの中央値と範囲。時刻は perl で取るので、1回あたり約10msの起動分を両方に含む。
+#   出力: 1行に「old|new ミリ秒」。最後に版ごとの中央値と範囲と失敗の数。失敗が1つでもあれば終了コード 1。
+#   時刻は perl で取るので、1回あたり約10msの起動分を両方に含む。
 set -u
 N="${1:-15}" REF="${2:-origin/main}" NAME="${3:-ceo}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -51,16 +52,17 @@ done
 ln -s "$NEW" "$H/.cam/bin/cam"
 
 now() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time*1000'; }
-run() {
-    local s e
+run() {  # 失敗したときは時間の後ろに ERR を付ける
+    local s e err=""
     s=$(now)
-    HOME="$H" "$1" trust || echo "ERR trust $1" >&2
-    HOME="$H" "$1" sync "$NAME" || echo "ERR sync $1" >&2
+    HOME="$H" "$1" trust >/dev/null 2>"$tmp/err.trust" || err=" ERR(trust)"
+    HOME="$H" "$1" sync "$NAME" >/dev/null 2>"$tmp/err.sync" || err="$err ERR(sync)"
     e=$(now)
-    echo $((e - s))
+    [[ -n "$err" ]] && cat "$tmp/err.trust" "$tmp/err.sync" >&2
+    echo "$((e - s))$err"
 }
 # 1回ずつ空走りして、trust と sync が書くものを書き終えた状態にする
-run "$OLD" >/dev/null 2>&1; run "$NEW" >/dev/null 2>&1
+run "$OLD" >/dev/null; run "$NEW" >/dev/null
 for ((i = 0; i < N; i++)); do
     if ((i % 2)); then
         echo "new $(run "$NEW")"; echo "old $(run "$OLD")"
@@ -74,3 +76,6 @@ for v in old new; do
         END {m = NR % 2 ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2
              printf "%s: %d回 中央値 %s ms（%s〜%s ms）\n", v, NR, m, a[1], a[NR]}'
 done
+errors=$(grep -c ERR "$tmp/out")
+echo "失敗: ${errors}回"
+[[ $errors == 0 ]]

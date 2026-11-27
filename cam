@@ -279,13 +279,14 @@ apply_sync_plan() {
     return 0
 }
 
-# 取り込む MCP（JSON のオブジェクト）を大元の mcpServers に足す。書けなければ 1 を返す
+# 取り込む MCP（JSON のオブジェクト）を大元の mcpServers に足す。jq が失敗したら 1 を返す。
+# if や || の中から呼ぶので set -e が効かない。前の版と同じく、mktemp・chmod・mv が失敗したら cam を止める
 adopt_write_master() {
     local add="$1" tmp
-    tmp=$(mktemp "$HOME/.claude.json.cam.XXXXXX")
+    tmp=$(mktemp "$HOME/.claude.json.cam.XXXXXX") || exit 1
     if jq --argjson a "$add" '.mcpServers = ((.mcpServers // {}) + $a)' "$MASTER_JSON" >"$tmp" && [[ -s "$tmp" ]]; then
-        chmod 600 "$tmp"
-        mv "$tmp" "$MASTER_JSON"
+        chmod 600 "$tmp" || exit 1
+        mv "$tmp" "$MASTER_JSON" || exit 1
         echo "cam: プロファイルで足された MCP を ~/.claude.json に取り込みました: $(jq -r 'keys | join(", ")' <<<"$add")" >&2
     else
         rm -f "$tmp"
