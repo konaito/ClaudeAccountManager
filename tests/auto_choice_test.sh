@@ -50,7 +50,8 @@ expect_auto() {  # expect_auto <説明> <今の時刻> <期待する起動先> <
         [[ -x "$f" ]] && grep -qx "$MARK" "$f" || { echo "中断: 偽物ではないコマンドがある: $f"; exit 2; }
     done
     printf '%s\n' "$@" >"$tmp/rows"
-    got=$(CAM_TEST_USAGE="$tmp/rows" CAM_TEST_NOW=$now "$CAM" auto 2>/dev/null)
+    got=$(CAM_TEST_USAGE="$tmp/rows" CAM_TEST_NOW=$now "$CAM" auto 2>"$tmp/err"; echo "exit=$?")
+    got=${got//$'\n'/ }
     if [[ "$got" == "$want" ]]; then echo "ok   $desc"; else echo "FAIL $desc"; echo "     want: $want"; echo "     got:  $got"; fail=1; fi
 }
 
@@ -60,7 +61,7 @@ expect_auto() {  # expect_auto <説明> <今の時刻> <期待する起動先> <
 # coo と同じ時刻の控えで 7d 45%（01:52 の値）と仮置きした。
 T0130=1795797000        # 2026-11-28 01:30 JST
 setup_bin - agent ceo coo cto shared
-expect_auto "判定できないとき上限のアカウントを選ばない（1:30 の実例）" $T0130 "ceo" \
+expect_auto "判定できないとき上限のアカウントを選ばない（1:30 の実例）" $T0130 "ceo exit=0" \
     "agent ok 100.0 81.0 1795798740 1796180340 $T0130" \
     "ceo cached 0.0 45.0 0 1796126340 1795717353 expired" \
     "coo cached 0.0 49.0 0 1796021940 1795717353 expired" \
@@ -69,31 +70,43 @@ expect_auto "判定できないとき上限のアカウントを選ばない（1
 
 # 値の分からないコマンドの中では、控えの5時間枠のリセット時刻を過ぎたものを先に選ぶ
 setup_bin - agent ceo coo
-expect_auto "判定できないとき5時間枠が戻った控えのコマンドを先に選ぶ" $T0130 "coo" \
+expect_auto "判定できないとき5時間枠が戻った控えのコマンドを先に選ぶ" $T0130 "coo exit=0" \
     "agent ok 100.0 81.0 1795798740 1796180340 $T0130" \
     "ceo notoken - - 0 0 0" \
     "coo cached 0.0 49.0 0 1796021940 1795717353 expired"
 
 # 5時間以内の控えで上限のコマンドも、値が分かるものとして外す
 setup_bin - agent ceo
-expect_auto "判定できないとき新しい控えで上限のコマンドも選ばない" $T0130 "ceo" \
+expect_auto "判定できないとき新しい控えで上限のコマンドも選ばない" $T0130 "ceo exit=0" \
     "agent cached 100.0 81.0 1795798740 1796180340 $((T0130 - 600))" \
     "ceo notoken - - 0 0 0"
 
+# 古い控えでも7日枠が 100% のコマンドは後にする（7日枠は5時間では戻らない）
+setup_bin - agent ceo coo
+expect_auto "判定できないとき古い控えで7日枠が上限のコマンドは後にする" $T0130 "coo exit=0" \
+    "agent ok 100.0 81.0 1795798740 1796180340 $T0130" \
+    "ceo cached 0.0 100.0 0 1796126340 1795717353 expired" \
+    "coo cached 0.0 49.0 0 1796021940 1795717353 expired"
+
 # 変わらない場面: 値の分かるコマンドが無いときは、これまでどおり --default、無ければ最初のコマンド
 setup_bin ceo agent ceo
-expect_auto "判定できないとき控えが無ければ --default のコマンド" $T0130 "ceo" \
+expect_auto "判定できないとき控えが無ければ --default のコマンド" $T0130 "ceo exit=0" \
     "agent notoken - - 0 0 0" \
     "ceo limited - - 0 0 0"
 setup_bin - agent ceo
-expect_auto "判定できないとき控えが無ければ最初のコマンド" $T0130 "agent" \
+expect_auto "判定できないとき控えが無ければ最初のコマンド" $T0130 "agent exit=0" \
     "agent notoken - - 0 0 0" \
     "ceo limited - - 0 0 0"
 
 # 変わらない場面: 全部が上限と分かっているときは起動しない
 setup_bin - agent ceo
-expect_auto "全部が上限なら起動しない" $T0130 "" \
+expect_auto "全部が上限なら起動しない" $T0130 "exit=1" \
     "agent ok 100.0 81.0 1795798740 1796180340 $T0130" \
     "ceo ok 30.0 100.0 1795798740 1796180340 $T0130"
+if grep -q '^cam: 使えるコマンドがありません。いちばん早く戻るのは agent' "$tmp/err"; then
+    echo "ok   全部が上限なら戻る時刻を出す"
+else
+    echo "FAIL 全部が上限なら戻る時刻を出す"; echo "     got:  $(head -1 "$tmp/err")"; fail=1
+fi
 
 exit $fail
