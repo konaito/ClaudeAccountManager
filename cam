@@ -355,34 +355,53 @@ cmd_remove() {
     fi
 }
 
-# Claude Code がそのコマンドのログインを置く Keychain の項目から OAuth のアクセストークンを読む。
+# Claude Code がそのコマンドのログインを置く Keychain の項目から claudeAiOauth（accessToken、expiresAt など）を JSON で読む。
 # CLAUDE_CONFIG_DIR を付けると項目名に sha256(パス) の先頭8桁が付く（ceo で確認）。
 # 同じ項目名で acct の違う項目が2つできることがある（ceo で、acct=unknown に mcpOAuth だけを持つ項目があった。issue #14）。
 # acct を指定しないと security はそちらを返すことがあるので、先に acct=$USER を読み、トークンが無ければ acct なしで読む。
-token_of() {
-    local name="$1" svc="Claude Code-credentials" tok
+# トークンが無ければ何も出さない。
+# CAM_TEST_KEYCHAIN にディレクトリを渡すと、Keychain の代わりにその中の <名前> のファイルを読む（試験用）。
+oauth_of() {
+    local name="$1" svc="Claude Code-credentials" oauth
+    if [[ -n "${CAM_TEST_KEYCHAIN:-}" ]]; then
+        jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' "$CAM_TEST_KEYCHAIN/$name" 2>/dev/null || true
+        return 0
+    fi
     if [[ -d "$PROFILES/$name" ]]; then
         svc+="-$(printf %s "$PROFILES/$name" | shasum -a 256 | cut -c1-8)"
     fi
-    tok=$(security find-generic-password -s "$svc" -a "$USER" -w 2>/dev/null \
-        | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
-    if [[ -z "$tok" ]]; then
-        tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-            | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
+    oauth=$(security find-generic-password -s "$svc" -a "$USER" -w 2>/dev/null \
+        | jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' 2>/dev/null || true)
+    if [[ -z "$oauth" ]]; then
+        oauth=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+            | jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' 2>/dev/null || true)
     fi
-    echo "$tok"
+    echo "$oauth"
 }
 
-# 使用率を API から取り、「状態 5h 7d 5hのリセット 7dのリセット」で出す。
+# 使用率を API から取り、「状態 5h 7d 5hのリセット 7dのリセット [わけ]」で出す。
 # 状態は ok（取れた）、limited（429 で断られた）、notoken（トークンが無いか期限切れ）、error（それ以外）。
 # ok 以外は数値の欄が「- - 0 0」になる。リセット時刻は epoch 秒で、不明は 0。
+# トークンの期限（expiresAt、ミリ秒）を過ぎていれば、API を呼ばずに notoken を返し、わけの欄に expired を付ける。
+# 期限切れのトークンでも API は 401 でなく 429 を返すことがあり、limited と見分けられないため（issue #17）。
 # /api/oauth/usage は公開されていない API で、低い頻度でも 429 を返すことがある。
+# CAM_TEST_API にファイルを渡すと、API を呼ばずにその中身を「本文、改行、HTTP の状態コード」として使う（試験用）。
 usage_of() {
-    local tok res code body line
-    tok=$(token_of "$1")
+    local oauth tok exp res code body line
+    oauth=$(oauth_of "$1")
+    tok=$(jq -r '.accessToken // empty' <<<"$oauth" 2>/dev/null)
     [[ -n "$tok" ]] || { echo "notoken - - 0 0"; return 0; }
-    res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
-        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || res=$'\n000'
+    exp=$(jq -r '.expiresAt | numbers | floor' <<<"$oauth" 2>/dev/null)
+    if [[ -n "$exp" ]] && (( exp / 1000 <= $(date +%s) )); then
+        echo "notoken - - 0 0 expired"
+        return 0
+    fi
+    if [[ -n "${CAM_TEST_API:-}" ]]; then
+        res=$(cat "$CAM_TEST_API")
+    else
+        res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
+            -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || res=$'\n000'
+    fi
     code=${res##*$'\n'}
     body=${res%$'\n'*}
     case "$code" in
@@ -401,13 +420,15 @@ usage_of() {
 # 前回取れた使用率の控え。1行「5h 7d 5hのリセット 7dのリセット 取った時刻」で、コマンドごとに1ファイル。
 USAGE_CACHE="$CAM_HOME/usage-cache"
 
-# 1コマンドぶんの行「名前 状態 5h 7d 5hのリセット 7dのリセット 値の時刻」を出す。
+# 1コマンドぶんの行「名前 状態 5h 7d 5hのリセット 7dのリセット 値の時刻 [わけ]」を出す。
 # 取れたら控えを書き、取れなければ控えを状態 cached で出す。
+# トークンの期限切れも、控えがあれば cached で出す。起動すれば Claude Code がトークンを更新するので、
+# 新しい控えは cam auto で使ってよい。わけの欄に expired を残し、表示と --json に理由を出す。
 # 控えのリセット時刻を過ぎた枠は、使用率を 0、リセット時刻を不明にする。
 usage_row() {
-    local name="$1" now st five seven r5 r7 at tmp
+    local name="$1" now st five seven r5 r7 why at tmp
     now=$(date +%s)
-    read -r st five seven r5 r7 <<<"$(usage_of "$name")"
+    read -r st five seven r5 r7 why <<<"$(usage_of "$name")"
     if [[ "$st" == ok ]]; then
         mkdir -p "$USAGE_CACHE"
         tmp=$(mktemp "$USAGE_CACHE/.$name.XXXXXX")
@@ -420,10 +441,10 @@ usage_row() {
         && read -r five seven r5 r7 at <"$USAGE_CACHE/$name" && [[ -n "$at" ]]; then
         if [[ "$r5" -gt 0 && "$r5" -le "$now" ]]; then five=0; r5=0; fi
         if [[ "$r7" -gt 0 && "$r7" -le "$now" ]]; then seven=0; r7=0; fi
-        echo "$name cached $five $seven $r5 $r7 $at"
+        echo "$name cached $five $seven $r5 $r7 $at${why:+ $why}"
         return 0
     fi
-    echo "$name $st - - 0 0 0"
+    echo "$name $st - - 0 0 0${why:+ $why}"
 }
 
 # リセット時刻（epoch 秒）をこの Mac の時刻で出す。不明なら「?」
@@ -519,8 +540,13 @@ choose_of() {
         }'
 }
 
-# 使用率が取れないときの理由
+# 使用率が取れないときの理由。reason_of <状態> <名前> [わけ]
+# わけが expired なら、状態（notoken か cached）にかかわらず期限切れの理由を出す。
 reason_of() {
+    if [[ "${3:-}" == expired ]]; then
+        echo "トークンの期限切れ。一度 $2 を起動すると更新される"
+        return 0
+    fi
     case "$1" in
         limited) echo "API に断られた（429）。しばらくすると取れる" ;;
         notoken) echo "トークンが無いか期限切れ。一度 $2 を起動すると更新される" ;;
@@ -529,17 +555,21 @@ reason_of() {
 }
 
 print_usage_rows() {
-    local name st five seven r5 r7 at note now
+    local name st five seven r5 r7 at why note now
     now=${CAM_TEST_NOW:-$(date +%s)}
-    while read -r name st five seven r5 r7 at; do
+    while read -r name st five seven r5 r7 at why; do
         [[ -n "$name" ]] || continue
         if [[ "$st" != ok && "$st" != cached ]]; then
-            printf '  %-10s 不明（%s）\n' "$name" "$(reason_of "$st" "$name")"
+            printf '  %-10s 不明（%s）\n' "$name" "$(reason_of "$st" "$name" "$why")"
             continue
         fi
         note=""
         if [[ "$st" == cached ]]; then
-            note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+            if [[ "$why" == expired ]]; then
+                note="  ※ $(date -r "$at" '+%H:%M') 時点の値（$(reason_of "$st" "$name" "$why")）"
+            else
+                note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+            fi
             (( now - at > STALE_SECONDS )) && note+="。5時間より前の値なので cam auto では使わない"
         fi
         printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）%s\n' \
@@ -550,24 +580,25 @@ print_usage_rows() {
 # メニューバーのアプリが読む JSON。
 # status は ok・cached・limited・notoken・error。as_of は値を取った時刻（epoch 秒）。
 # 使用率が取れず控えも無いコマンドは five_hour などが null になる。
+# reason は ok と cached では null。ただしトークンの期限切れの控え（cached）には期限切れの理由を入れる。
 # best は cam auto が選ぶコマンドで、選べないときは null。
 # choice は choose_of の結果（normal・fallback・none・unknown）。
 # next_available は choice が none のとき、いちばん早く戻るコマンドとその時刻（分からなければ null）。
 usage_json() {
-    local rows="$1" mode="$2" best="$3" next_at="$4" name st five seven r5 r7 at email
-    while read -r name st five seven r5 r7 at; do
+    local rows="$1" mode="$2" best="$3" next_at="$4" name st five seven r5 r7 at why email
+    while read -r name st five seven r5 r7 at why; do
         [[ -n "$name" ]] || continue
         if [[ -d "$PROFILES/$name" ]]; then
             email=$(account_of "$PROFILES/$name/.claude.json")
         else
             email=$(account_of "$MASTER_JSON")
         fi
-        jq -n --arg name "$name" --arg email "$email" --arg st "$st" --arg reason "$(reason_of "$st" "$name")" \
+        jq -n --arg name "$name" --arg email "$email" --arg st "$st" --arg reason "$(reason_of "$st" "$name" "$why")" --arg why "$why" \
             --arg five "$five" --arg seven "$seven" --arg r5 "$r5" --arg r7 "$r7" --arg at "$at" \
             'def num: if . == "" or . == "-" then null else tonumber end;
              def at: if . == "" or . == "0" then null else tonumber end;
              {name: $name, email: $email, status: $st,
-              reason: (if $st == "ok" or $st == "cached" then null else $reason end),
+              reason: (if $st == "ok" or ($st == "cached" and $why != "expired") then null else $reason end),
               as_of: ($at | at),
               five_hour: ($five | num), seven_day: ($seven | num),
               five_hour_resets_at: ($r5 | at), seven_day_resets_at: ($r7 | at)}'
