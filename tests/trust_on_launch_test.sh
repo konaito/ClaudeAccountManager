@@ -110,6 +110,11 @@ check "信頼されていない git の外のフォルダが入る" "$(trusted "
 # 8. ホームフォルダでは書かない（Claude Code はホームの信頼を記録しない）
 launch "$HOME" ceo
 check "ホームフォルダは書かない" "$(trusted "$HOME")" "$P/ceo/.claude.json" null
+# ホームが git リポジトリでも、その下の git の外のフォルダでホームを書かない
+mkdir -p "$HOME/.git" "$HOME/Downloads"
+launch "$HOME/Downloads" ceo
+check "ホームが git リポジトリでもホームを書かない" "$(trusted "$HOME")" "$P/ceo/.claude.json" null
+rmdir "$HOME/.git"
 
 # 9. --default のコマンドでも、全部の .claude.json に書いてから ~/.claude のまま起動する
 git_init "$W/repo2"

@@ -246,7 +246,7 @@ sync_claude_json() {
 # true のフォルダがあれば信頼済みとみなす。git リポジトリの中では、.git（フォルダかファイル）がある
 # いちばん近いフォルダでたどるのを止める。worktree とサブモジュールでは、それぞれのフォルダで止まる。
 # この範囲のどれかが信頼済みのファイルには何もしない。そうでないファイルには、git の中ならそのいちばん上を、
-# 外なら起動したフォルダを書く。ホームフォルダは書かない（Claude Code もホームの信頼は記録しない）。
+# 外なら起動したフォルダを書く。書く先がホームフォルダになるときは書かない（Claude Code もホームの信頼は記録しない）。
 # 書く先は ~/.claude.json とログイン済みの全プロファイルの .claude.json。読めないファイルは書かない。
 trust_cwd() {
     local cwd home d root="" key f tmp need
@@ -262,6 +262,7 @@ trust_cwd() {
         d="${d%/*}"; [[ -n "$d" ]] || d=/
     done
     key="${root:-$cwd}"
+    [[ "$key" == "$home" ]] && return 0
     for f in "$MASTER_JSON" "$PROFILES"/*/.claude.json; do
         [[ -f "$f" ]] && files+=("$f")
     done
