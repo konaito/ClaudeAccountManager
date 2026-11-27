@@ -82,7 +82,7 @@ unlink_per_account() {
     local dir="$1" p f t
     for p in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
         [[ -L "$p" ]] || continue
-        f=$(basename "$p")
+        f=${p##*/}
         per_account "$f" || continue
         t=$(readlink "$p")
         [[ "$t" == "$MASTER/"* ]] || continue
@@ -95,7 +95,7 @@ unlink_per_account() {
 unlink_self_loops() {
     local f p
     for f in "$MASTER"/* "$MASTER"/.[!.]* "$MASTER"/..?*; do
-        p="$f/$(basename "$f")"
+        p="$f/${f##*/}"
         [[ -L "$p" && "$(readlink "$p")" == "$f" ]] || continue
         rm -f "$p"
         echo "cam: 自分自身を指すリンク $p を消しました" >&2
@@ -141,7 +141,7 @@ sync_profile() {
     local entries=("$MASTER"/*)
     shopt -u nullglob dotglob
     for f in "${entries[@]}"; do
-        f=$(basename "$f")
+        f=${f##*/}
         per_account "$f" && continue
         if [[ -L "$dir/$f" ]]; then
             continue
@@ -159,26 +159,150 @@ sync_profile() {
 # それから大元の mcpServers と信頼済みフォルダを、ログイン済み（.claude.json がある）の全プロファイルへ写す。
 # 同時に起動した cam sync が大元を書き合わないよう、mkdir のロックで1つずつにする。取れなければ写すだけにする。
 sync_all_claude_json() {
-    local self="$1" lock="$CAM_HOME/.sync.lock" i got=0 pj
+    local self="$1" lock="$CAM_HOME/.sync.lock" i got=0 plan
     # 前の cam が途中で止まって残したロック（1分より古いもの）は消す
     [[ -d "$lock" && -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] && rmdir "$lock" 2>/dev/null
-    for i in $(seq 1 50); do
+    for ((i = 0; i < 50; i++)); do
         if mkdir "$lock" 2>/dev/null; then got=1; break; fi
         sleep 0.1
     done
-    [[ $got == 1 ]] && adopt_profile_mcp
-    # 起動するプロファイルは .claude.json がまだ無くても作る（初めての起動）。ほかはログイン済みのものだけ
-    sync_claude_json "$self"
-    for pj in "$PROFILES"/*/.claude.json; do
-        [[ -f "$pj" && "$(dirname "$pj")" != "$self" ]] && sync_claude_json "$(dirname "$pj")"
-    done
+    # 書き込みは if の条件の外で行う（条件の中では set -e が効かず、書き損じた一時ファイルで置き換えうる）
+    if plan=$(sync_plan "$got"); then
+        apply_sync_plan "$self" "$got" "$plan"
+    else
+        # 読めないファイルがあるときは、前の版と同じく1つずつ読んで同期する
+        [[ $got == 1 ]] && adopt_profile_mcp
+        sync_each_claude_json "$self"
+    fi
     [[ $got == 1 ]] && rmdir "$lock" 2>/dev/null
     return 0
+}
+
+# 起動するプロファイルは .claude.json がまだ無くても作る（初めての起動）。ほかはログイン済みのものだけ
+sync_each_claude_json() {
+    local self="$1" pj
+    sync_claude_json "$self"
+    for pj in "$PROFILES"/*/.claude.json; do
+        [[ -f "$pj" && "${pj%/*}" != "$self" ]] && sync_claude_json "${pj%/*}"
+    done
+    return 0
+}
+
+# sync_all_claude_json で何を書くかを、jq 1回の読み込みで決める（issue #26）。
+# 前の版は、プロファイルごとに大元と全プロファイルの .claude.json を jq で読み直していた（起動1回で約30回）。
+# ここでは大元と全プロファイルを1回だけ読み、取り込む MCP、配る MCP、信頼済みフォルダ、書き換えが要るファイルを出す。
+# 書き換えが要るかの判定は sync_claude_json と同じ結果になる。mcpServers が大元と同じ JSON の文字列で、
+# 信頼済みフォルダの hasTrustDialogAccepted が全部 true なら、写しても中身は変わらない。
+# 出力の1行目〜4行目: 取り込む MCP、大元の MCP の名前（大元が無ければ空）、配る MCP（大元が無ければ null）、信頼済みフォルダ。
+# 5行目から: 書き換えが要るプロファイルの .claude.json（まだ無いファイルは含まない）。
+# JSON の値がちょうど1つでないファイルや、オブジェクトでも null でもない .claude.json があれば失敗させ、
+# 前の版の1つずつの同期に任せる。
+SYNC_PLAN='
+[inputs | {f: input_filename, v: .}] as $all
+| if ($all | length) != $n or ($all | map(.f) | unique | length) != $n then error("not one value per file") else . end
+| ($all | map(select(.f == $master))) as $ms
+| ($all | map(select(.f != $master))) as $ps
+| (if ($ms | length) > 0 then ($ms[0].v | .mcpServers // {}) else null end) as $m
+| (if $adopt == 1 then
+     reduce $ps[] as $p ({}; . + ($p.v | (.mcpServers // {})
+         | with_entries(select((.key as $k | $m | has($k) | not) and (.key as $k | $l | index($k) | not)))))
+   else {} end) as $add
+| ([$all[].v | [.projects // {} | to_entries[] | select(.value.hasTrustDialogAccepted == true) | .key]] | add // [] | unique) as $t
+| ($m | tojson) as $mj
+| ($add | tojson),
+  (if $m == null then "" else ($m | keys | tojson) end),
+  $mj,
+  ($t | tojson),
+  ($ps[] | select(.v as $c
+      | if $c == null then ($m != null or ($t | length) > 0)
+        elif ($c | type) != "object" then error("not an object")
+        else (($m != null and (($c | has("mcpServers") | not) or ($c.mcpServers | tojson) != $mj))
+              or any($t[]; $c.projects[.].hasTrustDialogAccepted != true))
+        end) | .f)'
+
+# SYNC_PLAN を走らせる。$1 が 1 なら取り込む MCP も求める（大元が無いときは求めない）。読めないファイルがあれば失敗する
+sync_plan() {
+    local adopt="$1" ledger='[]' f
+    local -a files=()
+    for f in "$MASTER_JSON" "$PROFILES"/*/.claude.json; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    [[ ${#files[@]} -gt 0 ]] || return 1
+    [[ -f "$MASTER_JSON" ]] || adopt=0
+    if [[ $adopt == 1 ]]; then
+        ledger=$(jq -c 'if type == "array" then . else [] end' "$MCP_LEDGER" 2>/dev/null) || ledger='[]'
+    fi
+    jq -n -r --arg master "$MASTER_JSON" --argjson adopt "$adopt" --argjson l "$ledger" --argjson n "${#files[@]}" "$SYNC_PLAN" "${files[@]}" </dev/null 2>/dev/null
+}
+
+# sync_plan の結果どおりに書く。何も変わっていなければ、どのファイルも書かない。
+# 書き換えが要るファイルは、書く直前に読み直して作る（sync_claude_json）。
+apply_sync_plan() {
+    local self="$1" got="$2" plan="$3" add keys mcp trusted pj cur_keys n=0
+    local -a need=()
+    { IFS= read -r add; IFS= read -r keys; IFS= read -r mcp; IFS= read -r trusted; } <<<"$plan"
+    if [[ $got == 1 && -f "$MASTER_JSON" ]]; then
+        if [[ "$add" != '{}' ]]; then
+            if adopt_write_master "$add"; then
+                # 取り込んだ後の大元を読み直してから、配るものを決める
+                if ! plan=$(sync_plan 0); then
+                    write_ledger_from_master
+                    sync_each_claude_json "$self"
+                    return 0
+                fi
+                { IFS= read -r add; IFS= read -r keys; IFS= read -r mcp; IFS= read -r trusted; } <<<"$plan"
+            else
+                keys=""
+            fi
+        fi
+        # 台帳を大元の名前にそろえる。同じなら書かない
+        if [[ -n "$keys" ]]; then
+            cur_keys=""
+            [[ -f "$MCP_LEDGER" ]] && cur_keys=$(<"$MCP_LEDGER")
+            [[ "$cur_keys" == "$keys" ]] || write_ledger "$keys"
+        fi
+    fi
+    while IFS= read -r pj; do
+        n=$((n + 1))
+        [[ $n -gt 4 && -n "$pj" ]] && need+=("$pj")
+    done <<<"$plan"
+    # 起動するプロファイルを先に書く。まだ .claude.json が無くても作る（初めての起動）
+    if [[ ! -f "$self/.claude.json" ]]; then
+        sync_claude_json "$self" "$mcp" "$trusted"
+    fi
+    for pj in ${need[@]+"${need[@]}"}; do
+        [[ "${pj%/*}" == "$self" ]] && sync_claude_json "$self" "$mcp" "$trusted"
+    done
+    for pj in ${need[@]+"${need[@]}"}; do
+        [[ "${pj%/*}" != "$self" ]] && sync_claude_json "${pj%/*}" "$mcp" "$trusted"
+    done
+    return 0
+}
+
+# 取り込む MCP（JSON のオブジェクト）を大元の mcpServers に足す。書けなければ 1 を返す
+adopt_write_master() {
+    local add="$1" tmp
+    tmp=$(mktemp "$HOME/.claude.json.cam.XXXXXX")
+    if jq --argjson a "$add" '.mcpServers = ((.mcpServers // {}) + $a)' "$MASTER_JSON" >"$tmp" && [[ -s "$tmp" ]]; then
+        chmod 600 "$tmp"
+        mv "$tmp" "$MASTER_JSON"
+        echo "cam: プロファイルで足された MCP を ~/.claude.json に取り込みました: $(jq -r 'keys | join(", ")' <<<"$add")" >&2
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+write_ledger() {
+    local tmp
+    tmp=$(mktemp "$CAM_HOME/.mcp-ledger.XXXXXX")
+    printf '%s\n' "$1" >"$tmp" && mv "$tmp" "$MCP_LEDGER" || rm -f "$tmp"
 }
 
 # プロファイルの中で足された MCP（大元に無く、台帳にも無い名前）を大元の mcpServers へ取り込む。
 # 台帳にある名前は大元から消されたものなので取り込まない。同じ名前で中身が違うときは大元を残す。
 # 大元は Claude Code（--default のコマンド）も書くので、取り込むものがあるときだけ書き換える。最後に台帳を大元の名前にそろえる。
+# 読めないファイルがあって sync_plan が失敗したときだけ使う。
 adopt_profile_mcp() {
     [[ -f "$MASTER_JSON" ]] || return 0
     local master ledger add f tmp
@@ -192,16 +316,13 @@ adopt_profile_mcp() {
             | $a + . ' "$f" 2>/dev/null) || add='{}'
     done
     if [[ "$add" != '{}' ]]; then
-        tmp=$(mktemp "$HOME/.claude.json.cam.XXXXXX")
-        if jq --argjson a "$add" '.mcpServers = ((.mcpServers // {}) + $a)' "$MASTER_JSON" >"$tmp" && [[ -s "$tmp" ]]; then
-            chmod 600 "$tmp"
-            mv "$tmp" "$MASTER_JSON"
-            echo "cam: プロファイルで足された MCP を ~/.claude.json に取り込みました: $(jq -r 'keys | join(", ")' <<<"$add")" >&2
-        else
-            rm -f "$tmp"
-            return 0
-        fi
+        adopt_write_master "$add" || return 0
     fi
+    write_ledger_from_master
+}
+
+write_ledger_from_master() {
+    local tmp
     tmp=$(mktemp "$CAM_HOME/.mcp-ledger.XXXXXX")
     jq -c '.mcpServers // {} | keys' "$MASTER_JSON" >"$tmp" 2>/dev/null && mv "$tmp" "$MCP_LEDGER" || rm -f "$tmp"
 }
@@ -218,14 +339,18 @@ trusted_dirs() {
 
 # プロファイルの .claude.json に、~/.claude.json の mcpServers と、
 # どれかのアカウントで信頼したフォルダを写す。変わるときだけ書き換える。
+# 配る MCP と信頼済みフォルダを $2・$3 で渡されたときは、それを使う（sync_plan で求めたもの）。
 sync_claude_json() {
     local dir="$1" pj="$1/.claude.json" mcp trusted cur new tmp
-    if [[ -f "$MASTER_JSON" ]]; then
+    if [[ $# -ge 3 ]]; then
+        mcp="$2" trusted="$3"
+    elif [[ -f "$MASTER_JSON" ]]; then
         mcp=$(jq -c '.mcpServers // {}' "$MASTER_JSON" 2>/dev/null) || mcp=null
+        trusted=$(trusted_dirs)
     else
         mcp=null
+        trusted=$(trusted_dirs)
     fi
-    trusted=$(trusted_dirs)
     if [[ -f "$pj" ]]; then
         cur=$(jq -c . "$pj" 2>/dev/null) || { echo "cam: $pj を読めないので MCP と信頼済みフォルダは同期しません" >&2; return 0; }
     else
@@ -293,21 +418,18 @@ trust_cwd() {
 # 起動用コマンドの中身を出す。1行目のあとの説明の行で、cam が作ったものとその種類を見分ける
 launcher_text() {
     local name="$1" mode="$2"
+    # 起動のたびに upgrade_launchers が全部の起動用コマンドと比べるので、cat を起動しない printf で出す
     if [[ "$mode" == default ]]; then
-        cat <<EOF
-#!/bin/bash
-# cam: $name は ~/.claude（既定のログイン）で起動する
-"$BIN/cam" trust || true
-exec claude "\$@"
-EOF
+        printf '%s\n' '#!/bin/bash' \
+            "# cam: $name は ~/.claude（既定のログイン）で起動する" \
+            "\"$BIN/cam\" trust || true" \
+            'exec claude "$@"'
     else
-        cat <<EOF
-#!/bin/bash
-# cam: $name は ~/.cam/profiles/$name で起動する
-"$BIN/cam" trust || true
-"$BIN/cam" sync "$name" || true
-CLAUDE_CONFIG_DIR="$PROFILES/$name" exec claude "\$@"
-EOF
+        printf '%s\n' '#!/bin/bash' \
+            "# cam: $name は ~/.cam/profiles/$name で起動する" \
+            "\"$BIN/cam\" trust || true" \
+            "\"$BIN/cam\" sync \"$name\" || true" \
+            "CLAUDE_CONFIG_DIR=\"$PROFILES/$name\" exec claude \"\$@\""
     fi
 }
 
@@ -326,9 +448,10 @@ upgrade_launchers() {
     local f name mode line
     for f in "$BIN"/*; do
         [[ -f "$f" && ! -L "$f" ]] || continue
-        name=$(basename "$f")
+        name=${f##*/}
         [[ "$name" == cam ]] && continue
-        line=$(sed -n 2p "$f" 2>/dev/null) || continue
+        # 2行目を読む。sed を起動しないよう read で読む（改行で終わらない2行目も読む）
+        { IFS= read -r line; IFS= read -r line || [[ -n "$line" ]]; } <"$f" 2>/dev/null || continue
         case "$line" in
             "# cam: $name は ~/.claude（既定のログイン）で起動する") mode=default ;;
             "# cam: $name は ~/.cam/profiles/$name で起動する") mode=profile ;;
