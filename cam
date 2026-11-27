@@ -474,14 +474,24 @@ collect_usage() {
     rm -rf "$tmp"
 }
 
-# 判定できないときの行き先: --default のコマンド、無ければ最初のコマンド
+# 判定できない（choose_of が unknown）ときの行き先。入力は collect_usage の行。
+# 値の分かるコマンド（ok と、STALE_SECONDS 以内の cached）は、unknown のときは全部上限なので候補から外す（issue #18）。
+# 残った値の分からないコマンドの中では、控えの5時間枠のリセット時刻を過ぎていて、7日枠が上限でないものを先にする。
+# usage_row はリセット時刻を過ぎた枠を 0% とリセット時刻 0 にして渡すので、0% でリセット時刻 0 も過ぎたものに数える。
+# 同じ順位の中では --default のコマンド、無ければコマンド順で先のほう。
 fallback_of() {
-    local name fallback=""
-    while read -r name _; do
-        if [[ -z "$fallback" ]] || [[ -d "$PROFILES/$fallback" && ! -d "$PROFILES/$name" ]]; then
-            fallback="$name"
+    local rank name fallback="" frank=9
+    while read -r rank name; do
+        if [[ -z "$fallback" || $rank -lt $frank ]] \
+            || [[ $rank -eq $frank && -d "$PROFILES/$fallback" && ! -d "$PROFILES/$name" ]]; then
+            fallback="$name"; frank=$rank
         fi
-    done
+    done < <(awk -v now="${CAM_TEST_NOW:-$(date +%s)}" -v stale="$STALE_SECONDS" '
+        $2 == "ok" || ($2 == "cached" && now - $7 <= stale) { next }
+        {
+            passed = $2 == "cached" && (($5 > 0 && $5 <= now) || ($5 == 0 && $3 + 0 == 0)) && $4 + 0 < 100
+            print (passed ? 0 : 1), $1
+        }')
     echo "$fallback"
 }
 
