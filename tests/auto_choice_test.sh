@@ -33,6 +33,17 @@ expect "古い控えだけなら判定できない" "cam auto: （判定でき�
 # 偽物を置く。本物のコマンドを起動しないよう、走らせる前に HOME と偽物を確かめ、違えば中断する。
 export HOME="$tmp/home"
 MARK="# cam-test-fake"
+# 判定できないとき、cam auto は期限切れのコマンドを cam refresh で更新しようとする（issue #29）。
+# ここでは Keychain を空のディレクトリ（CAM_TEST_KEYCHAIN）に替えてトークンが無い形にし、更新を飛ばさせる。
+# 万一走っても本物に届かないよう、claude は呼ばれた回数を残すだけの偽物を PATH の先頭に置き、
+# 動いている claude の一覧（CAM_TEST_PS）も空にする。
+export CAM_TEST_KEYCHAIN="$tmp/keychain"
+export CAM_TEST_PS="$tmp/ps"
+mkdir -p "$CAM_TEST_KEYCHAIN" "$tmp/fakebin"
+: >"$CAM_TEST_PS"
+printf '#!/bin/sh\n# cam-test-fake-claude\necho x >>"%s"\n' "$tmp/claude_calls" >"$tmp/fakebin/claude"
+chmod +x "$tmp/fakebin/claude"
+export PATH="$tmp/fakebin:$PATH"
 setup_bin() {  # setup_bin <--default のコマンド（無ければ -）> <名前...>
     local def="$1" n; shift
     rm -rf "$HOME"
@@ -46,6 +57,7 @@ setup_bin() {  # setup_bin <--default のコマンド（無ければ -）> <名�
 expect_auto() {  # expect_auto <説明> <今の時刻> <期待する起動先> <入力の行...>
     local desc="$1" now="$2" want="$3" f; shift 3
     case "$HOME" in "$tmp"/*) ;; *) echo "中断: HOME が一時ディレクトリではない: $HOME"; exit 2 ;; esac
+    [[ "$(command -v claude)" == "$tmp/fakebin/claude" ]] || { echo "中断: claude が偽物を指していない: $(command -v claude)"; exit 2; }
     for f in "$HOME/.cam/bin"/*; do
         [[ -x "$f" ]] && grep -qx "$MARK" "$f" || { echo "中断: 偽物ではないコマンドがある: $f"; exit 2; }
     done
@@ -107,6 +119,13 @@ if grep -q '^cam: 使えるコマンドがありません。いちばん早く�
     echo "ok   全部が上限なら戻る時刻を出す"
 else
     echo "FAIL 全部が上限なら戻る時刻を出す"; echo "     got:  $(head -1 "$tmp/err")"; fail=1
+fi
+
+# 判定できないときの試験で、トークンが無いので claude は1回も走らない
+if [[ ! -e "$tmp/claude_calls" ]]; then
+    echo "ok   トークンが無ければ claude を走らせない"
+else
+    echo "FAIL トークンが無ければ claude を走らせない"; echo "     got:  $(wc -l <"$tmp/claude_calls") 回"; fail=1
 fi
 
 exit $fail
