@@ -422,16 +422,13 @@ USAGE_CACHE="$CAM_HOME/usage-cache"
 
 # 1コマンドぶんの行「名前 状態 5h 7d 5hのリセット 7dのリセット 値の時刻 [わけ]」を出す。
 # 取れたら控えを書き、取れなければ控えを状態 cached で出す。
-# トークンの期限切れは、控えがあっても notoken のまま出す。起動するまで値は取れないので、理由を見せる。
+# トークンの期限切れも、控えがあれば cached で出す。起動すれば Claude Code がトークンを更新するので、
+# 新しい控えは cam auto で使ってよい。わけの欄に expired を残し、表示と --json に理由を出す。
 # 控えのリセット時刻を過ぎた枠は、使用率を 0、リセット時刻を不明にする。
 usage_row() {
     local name="$1" now st five seven r5 r7 why at tmp
     now=$(date +%s)
     read -r st five seven r5 r7 why <<<"$(usage_of "$name")"
-    if [[ "$why" == expired ]]; then
-        echo "$name notoken - - 0 0 0 expired"
-        return 0
-    fi
     if [[ "$st" == ok ]]; then
         mkdir -p "$USAGE_CACHE"
         tmp=$(mktemp "$USAGE_CACHE/.$name.XXXXXX")
@@ -444,10 +441,10 @@ usage_row() {
         && read -r five seven r5 r7 at <"$USAGE_CACHE/$name" && [[ -n "$at" ]]; then
         if [[ "$r5" -gt 0 && "$r5" -le "$now" ]]; then five=0; r5=0; fi
         if [[ "$r7" -gt 0 && "$r7" -le "$now" ]]; then seven=0; r7=0; fi
-        echo "$name cached $five $seven $r5 $r7 $at"
+        echo "$name cached $five $seven $r5 $r7 $at${why:+ $why}"
         return 0
     fi
-    echo "$name $st - - 0 0 0"
+    echo "$name $st - - 0 0 0${why:+ $why}"
 }
 
 # リセット時刻（epoch 秒）をこの Mac の時刻で出す。不明なら「?」
@@ -544,8 +541,9 @@ choose_of() {
 }
 
 # 使用率が取れないときの理由。reason_of <状態> <名前> [わけ]
+# わけが expired なら、状態（notoken か cached）にかかわらず期限切れの理由を出す。
 reason_of() {
-    if [[ "$1" == notoken && "${3:-}" == expired ]]; then
+    if [[ "${3:-}" == expired ]]; then
         echo "トークンの期限切れ。一度 $2 を起動すると更新される"
         return 0
     fi
@@ -567,7 +565,11 @@ print_usage_rows() {
         fi
         note=""
         if [[ "$st" == cached ]]; then
-            note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+            if [[ "$why" == expired ]]; then
+                note="  ※ $(date -r "$at" '+%H:%M') 時点の値（$(reason_of "$st" "$name" "$why")）"
+            else
+                note="  ※ $(date -r "$at" '+%H:%M') 時点の値（API から取れなかった）"
+            fi
             (( now - at > STALE_SECONDS )) && note+="。5時間より前の値なので cam auto では使わない"
         fi
         printf '  %-10s 5h %5.1f%%（%s まで）  7d %5.1f%%（%s まで）%s\n' \
@@ -578,6 +580,7 @@ print_usage_rows() {
 # メニューバーのアプリが読む JSON。
 # status は ok・cached・limited・notoken・error。as_of は値を取った時刻（epoch 秒）。
 # 使用率が取れず控えも無いコマンドは five_hour などが null になる。
+# reason は ok と cached では null。ただしトークンの期限切れの控え（cached）には期限切れの理由を入れる。
 # best は cam auto が選ぶコマンドで、選べないときは null。
 # choice は choose_of の結果（normal・fallback・none・unknown）。
 # next_available は choice が none のとき、いちばん早く戻るコマンドとその時刻（分からなければ null）。
@@ -590,12 +593,12 @@ usage_json() {
         else
             email=$(account_of "$MASTER_JSON")
         fi
-        jq -n --arg name "$name" --arg email "$email" --arg st "$st" --arg reason "$(reason_of "$st" "$name" "$why")" \
+        jq -n --arg name "$name" --arg email "$email" --arg st "$st" --arg reason "$(reason_of "$st" "$name" "$why")" --arg why "$why" \
             --arg five "$five" --arg seven "$seven" --arg r5 "$r5" --arg r7 "$r7" --arg at "$at" \
             'def num: if . == "" or . == "-" then null else tonumber end;
              def at: if . == "" or . == "0" then null else tonumber end;
              {name: $name, email: $email, status: $st,
-              reason: (if $st == "ok" or $st == "cached" then null else $reason end),
+              reason: (if $st == "ok" or ($st == "cached" and $why != "expired") then null else $reason end),
               as_of: ($at | at),
               five_hour: ($five | num), seven_day: ($seven | num),
               five_hour_resets_at: ($r5 | at), seven_day_resets_at: ($r7 | at)}'
