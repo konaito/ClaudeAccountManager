@@ -36,24 +36,36 @@ check "期限切れは notoken（--json の status）" "$(json '.accounts[0].sta
 check "期限切れの理由（--json の reason）" "$(json '.accounts[0].reason')" "$EXPIRED_REASON"
 check "期限切れの理由（cam usage）" "$("$CAM" usage | grep -c "coo .*不明（${EXPIRED_REASON}）")" "1"
 
-# 2. 控えがあっても、期限切れなら控えの値ではなく期限切れを出す
+# 2. 期限切れでも5時間以内の控えがあれば、控えの値を cached で出し、期限切れの理由も出す。
+#    cam auto が起動すれば Claude Code がトークンを更新するので、cam auto の候補に入れる
 mkdir -p "$HOME/.cam/usage-cache"
-echo "0.0 49.0 0 1796021999 $((NOW - 600))" >"$HOME/.cam/usage-cache/coo"
-check "控えがあっても期限切れは notoken" "$(json '.accounts[0].status')" "notoken"
+echo "0.0 10.0 0 $((NOW + 3 * 86400)) $((NOW - 600))" >"$HOME/.cam/usage-cache/coo"
+check "期限切れでも新しい控えは cached（--json）" \
+    "$(json '.accounts[0] | "\(.status) \(.five_hour == 0) \(.seven_day == 10) \(.reason)"')" \
+    "cached true true $EXPIRED_REASON"
+check "期限切れでも新しい控えは cam auto の候補" "$(json '"\(.choice) \(.best)"')" "normal coo"
+check "期限切れの控えの行に理由（cam usage）" \
+    "$("$CAM" usage | grep -c "coo .*5h   0.0%.*時点の値.*${EXPIRED_REASON}")" "1"
 
-# 3. 期限内のトークンは、これまでどおり API の値で ok になる
+# 3. 期限切れで控えが5時間より古ければ、これまでどおり cam auto では使わない（STALE_SECONDS）
+echo "0.0 10.0 0 $((NOW + 3 * 86400)) $((NOW - 6 * 3600))" >"$HOME/.cam/usage-cache/coo"
+check "期限切れで古い控えは cached だが候補にしない" \
+    "$(json '"\(.accounts[0].status) \(.accounts[0].reason) \(.choice)"')" \
+    "cached $EXPIRED_REASON unknown"
+
+# 4. 期限内のトークンは、これまでどおり API の値で ok になる
 setup ceo "{\"accessToken\":\"x\",\"expiresAt\":$FUTURE_MS}" "$OK_BODY" 200
 check "期限内は ok" "$(json '.accounts[0] | "\(.status) \(.five_hour == 12) \(.seven_day == 40)"')" "ok true true"
 
-# 4. expiresAt が無いトークンは期限切れとみなさず API を呼ぶ
+# 5. expiresAt が無いトークンは期限切れとみなさず API を呼ぶ
 setup ceo '{"accessToken":"x"}' "$OK_BODY" 200
 check "expiresAt が無ければ API を呼ぶ" "$(json '.accounts[0].status')" "ok"
 
-# 5. 期限内でも API が 429 なら、これまでどおり limited
+# 6. 期限内でも API が 429 なら、これまでどおり limited
 setup ceo "{\"accessToken\":\"x\",\"expiresAt\":$FUTURE_MS}" '{"error":"rate_limited"}' 429
 check "期限内の 429 は limited" "$(json '.accounts[0].status')" "limited"
 
-# 6. トークンが無いときは、これまでどおり notoken で、理由は期限切れとは分ける
+# 7. トークンが無いときは、これまでどおり notoken で、理由は期限切れとは分ける
 setup ceo 'null' '' 000
 check "トークンが無ければ notoken" "$(json '.accounts[0] | "\(.status) \(.reason)"')" \
     "notoken トークンが無いか期限切れ。一度 ceo を起動すると更新される"
