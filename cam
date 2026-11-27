@@ -1043,7 +1043,8 @@ auto_refresh() {
     while read -r name; do
         [[ -n "$name" ]] || continue
         printf 'cam: %s のトークンが期限切れなので更新します（cam refresh %s、1つ数秒）… ' "$name" "$name" >&2
-        line=$(refresh_one "$name") || true
+        # 対象の名前は標準入力から読んでいるので、中で走るもの（security、ps、claude）には渡さない
+        line=$(refresh_one "$name" </dev/null) || true
         line=${line#"$name"}
         line=${line#"${line%%[! ]*}"}
         echo "${line:-結果が分からない}" >&2
@@ -1052,7 +1053,7 @@ auto_refresh() {
     while read -r line; do
         [[ -n "$line" ]] || continue
         name=${line%% *}
-        if [[ "$fresh" == *" $name "* ]]; then usage_row "$name"; else echo "$line"; fi
+        if [[ "$fresh" == *" $name "* ]]; then usage_row "$name" </dev/null; else echo "$line"; fi
     done <<<"$rows"
 }
 
