@@ -355,34 +355,46 @@ cmd_remove() {
     fi
 }
 
-# Claude Code がそのコマンドのログインを置く Keychain の項目から OAuth のアクセストークンを読む。
+# Claude Code がそのコマンドのログインを置く Keychain の項目から claudeAiOauth（accessToken、expiresAt など）を JSON で読む。
 # CLAUDE_CONFIG_DIR を付けると項目名に sha256(パス) の先頭8桁が付く（ceo で確認）。
 # 同じ項目名で acct の違う項目が2つできることがある（ceo で、acct=unknown に mcpOAuth だけを持つ項目があった。issue #14）。
 # acct を指定しないと security はそちらを返すことがあるので、先に acct=$USER を読み、トークンが無ければ acct なしで読む。
-token_of() {
-    local name="$1" svc="Claude Code-credentials" tok
+# トークンが無ければ何も出さない。
+# CAM_TEST_KEYCHAIN にディレクトリを渡すと、Keychain の代わりにその中の <名前> のファイルを読む（試験用）。
+oauth_of() {
+    local name="$1" svc="Claude Code-credentials" oauth
+    if [[ -n "${CAM_TEST_KEYCHAIN:-}" ]]; then
+        jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' "$CAM_TEST_KEYCHAIN/$name" 2>/dev/null || true
+        return 0
+    fi
     if [[ -d "$PROFILES/$name" ]]; then
         svc+="-$(printf %s "$PROFILES/$name" | shasum -a 256 | cut -c1-8)"
     fi
-    tok=$(security find-generic-password -s "$svc" -a "$USER" -w 2>/dev/null \
-        | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
-    if [[ -z "$tok" ]]; then
-        tok=$(security find-generic-password -s "$svc" -w 2>/dev/null \
-            | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null || true)
+    oauth=$(security find-generic-password -s "$svc" -a "$USER" -w 2>/dev/null \
+        | jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' 2>/dev/null || true)
+    if [[ -z "$oauth" ]]; then
+        oauth=$(security find-generic-password -s "$svc" -w 2>/dev/null \
+            | jq -c '.claudeAiOauth | select(.accessToken // "" | . != "")' 2>/dev/null || true)
     fi
-    echo "$tok"
+    echo "$oauth"
 }
 
 # 使用率を API から取り、「状態 5h 7d 5hのリセット 7dのリセット」で出す。
 # 状態は ok（取れた）、limited（429 で断られた）、notoken（トークンが無いか期限切れ）、error（それ以外）。
 # ok 以外は数値の欄が「- - 0 0」になる。リセット時刻は epoch 秒で、不明は 0。
 # /api/oauth/usage は公開されていない API で、低い頻度でも 429 を返すことがある。
+# CAM_TEST_API にファイルを渡すと、API を呼ばずにその中身を「本文、改行、HTTP の状態コード」として使う（試験用）。
 usage_of() {
-    local tok res code body line
-    tok=$(token_of "$1")
+    local oauth tok res code body line
+    oauth=$(oauth_of "$1")
+    tok=$(jq -r '.accessToken // empty' <<<"$oauth" 2>/dev/null)
     [[ -n "$tok" ]] || { echo "notoken - - 0 0"; return 0; }
-    res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
-        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || res=$'\n000'
+    if [[ -n "${CAM_TEST_API:-}" ]]; then
+        res=$(cat "$CAM_TEST_API")
+    else
+        res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
+            -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || res=$'\n000'
+    fi
     code=${res##*$'\n'}
     body=${res%$'\n'*}
     case "$code" in
