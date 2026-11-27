@@ -42,6 +42,8 @@ MCP を消すときは `~/.claude.json` から消します（`env -u CLAUDE_CONF
 
 動いているセッションは、起動したときに読んだ設定のままです。同期した内容は、そのアカウントを次に起動したときに使われます。同時に起動した cam が `~/.claude.json` を書き合わないよう、同期は `~/.cam/.sync.lock` で1つずつにします。1分より古いロックは、止まった cam の残りとして消します。
 
+`cam sync` は、大元と全プロファイルの `.claude.json` を jq で1回だけ読み、写す必要があるファイルだけを書きます。何も変わっていなければ、どのファイルも書きません。読めないファイルがあるときは、1つずつ読んで同期します。
+
 ## 置き場所
 
 - このリポジトリ: `cam` 本体
@@ -116,5 +118,7 @@ menubar/install.sh   # ビルドして ~/Applications/CamBar.app に置き、ロ
 - `cam remove` は Keychain の項目を消しません
 - MCP と信頼済みフォルダの同期の回帰テストは `tests/mcp_sync_test.sh` です。HOME を一時ディレクトリに替えて動かします
 - 起動時に信頼済みにする試験は `tests/trust_on_launch_test.sh` です。HOME を一時ディレクトリに替え、偽の claude を PATH の先頭に置いて動かします
+- 変わっていない `cam sync` が何も書かないことと、入力が変わったら同期し直すことの試験は `tests/sync_unchanged_test.sh` です
+- 起動用コマンドの前段（`cam trust` と `cam sync`）の時間は、`bench/launch_prefix.sh [回数] [比べる版]` で測ります。本物の設定を一時 HOME に写して、2つの版を交互に走らせます
 
 共通にするファイルの一覧は [ccd](https://github.com/Nael-Nathanael/ccd)（MIT）を参考にしました。
