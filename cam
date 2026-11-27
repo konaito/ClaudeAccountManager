@@ -152,6 +152,7 @@ sync_profile() {
         fi
     done
     sync_all_claude_json "$dir"
+    upgrade_launchers
 }
 
 # 全プロファイルの .claude.json を同期する。先にプロファイルで足された MCP を大元へ取り込み、
@@ -240,23 +241,104 @@ sync_claude_json() {
     mv "$tmp" "$pj"
 }
 
-write_launcher() {
-    local name="$1" mode="$2" out="$BIN/$1"
+# 起動したフォルダを、Claude Code が信頼を探す範囲で信頼済みにする（issue #24）。
+# Claude Code 2.1.332 は、起動したフォルダの実体のパスから上へたどり、projects[パス].hasTrustDialogAccepted が
+# true のフォルダがあれば信頼済みとみなす。git リポジトリの中では、.git（フォルダかファイル）がある
+# いちばん近いフォルダでたどるのを止める。worktree とサブモジュールでは、それぞれのフォルダで止まる。
+# この範囲のどれかが信頼済みのファイルには何もしない。そうでないファイルには、git の中ならそのいちばん上を、
+# 外なら起動したフォルダを書く。書く先がホームフォルダになるときは書かない（Claude Code もホームの信頼は記録しない）。
+# 書く先は ~/.claude.json とログイン済みの全プロファイルの .claude.json。読めないファイルは書かない。
+trust_cwd() {
+    local cwd home d root="" key f tmp need
+    local -a range=() files=()
+    cwd=$(pwd -P 2>/dev/null) || return 0
+    home=$(cd "$HOME" 2>/dev/null && pwd -P) || home="$HOME"
+    [[ "$cwd" == "$home" ]] && return 0
+    d="$cwd"
+    while :; do
+        range+=("$d")
+        if [[ -d "$d/.git" || -f "$d/.git" ]]; then root="$d"; break; fi
+        [[ "$d" == / ]] && break
+        d="${d%/*}"; [[ -n "$d" ]] || d=/
+    done
+    key="${root:-$cwd}"
+    [[ "$key" == "$home" ]] && return 0
+    for f in "$MASTER_JSON" "$PROFILES"/*/.claude.json; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    [[ ${#files[@]} -gt 0 ]] || return 0
+    local filter='select(type == "object" and ([($r | split("\n"))[] as $p | (try .projects[$p].hasTrustDialogAccepted catch null) == true] | any | not)) | input_filename'
+    local range_text
+    range_text=$(printf '%s\n' "${range[@]}"); range_text="${range_text%$'\n'}"
+    # ふだんは1回の jq で全ファイルを見る。読めないファイルがあると jq はそこで止まるので、1つずつ見直す
+    if ! need=$(jq -r --arg r "$range_text" "$filter" "${files[@]}" 2>/dev/null); then
+        need=""
+        for f in "${files[@]}"; do
+            need+=$(jq -r --arg r "$range_text" "$filter" "$f" 2>/dev/null)$'\n' || true
+        done
+    fi
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        tmp=$(mktemp "$f.cam.XXXXXX") || continue
+        if jq --arg k "$key" '.projects[$k].hasTrustDialogAccepted = true' "$f" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+            chmod 600 "$tmp"
+            mv "$tmp" "$f"
+        else
+            rm -f "$tmp"
+        fi
+    done <<<"$need"
+    return 0
+}
+
+# 起動用コマンドの中身を出す。1行目のあとの説明の行で、cam が作ったものとその種類を見分ける
+launcher_text() {
+    local name="$1" mode="$2"
     if [[ "$mode" == default ]]; then
-        cat >"$out" <<EOF
+        cat <<EOF
 #!/bin/bash
 # cam: $name は ~/.claude（既定のログイン）で起動する
+"$BIN/cam" trust || true
 exec claude "\$@"
 EOF
     else
-        cat >"$out" <<EOF
+        cat <<EOF
 #!/bin/bash
 # cam: $name は ~/.cam/profiles/$name で起動する
+"$BIN/cam" trust || true
 "$BIN/cam" sync "$name" || true
 CLAUDE_CONFIG_DIR="$PROFILES/$name" exec claude "\$@"
 EOF
     fi
-    chmod +x "$out"
+}
+
+# 動いている起動用コマンドを書き換えることがあるので、一時ファイルに書いてから mv で置き換える
+write_launcher() {
+    local name="$1" mode="$2" out="$BIN/$1" tmp
+    tmp=$(mktemp "$BIN/.$name.cam.XXXXXX")
+    launcher_text "$name" "$mode" >"$tmp"
+    chmod 755 "$tmp"
+    mv "$tmp" "$out"
+}
+
+# 前の版の cam が作った起動用コマンドを、今の形に作り直す。cam が作ったもの（2行目の説明が cam の形）だけを見る。
+# 起動用コマンドは cam sync を呼ぶので、どれかのプロファイルを起動すると、次の起動から今の形で動く。
+upgrade_launchers() {
+    local f name mode line
+    for f in "$BIN"/*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        name=$(basename "$f")
+        [[ "$name" == cam ]] && continue
+        line=$(sed -n 2p "$f" 2>/dev/null) || continue
+        case "$line" in
+            "# cam: $name は ~/.claude（既定のログイン）で起動する") mode=default ;;
+            "# cam: $name は ~/.cam/profiles/$name で起動する") mode=profile ;;
+            *) continue ;;
+        esac
+        [[ "$(<"$f")" == "$(launcher_text "$name" "$mode")" ]] && continue
+        write_launcher "$name" "$mode"
+        echo "cam: 起動用コマンド $name を今の形に作り直しました" >&2
+    done
+    return 0
 }
 
 # プロファイルで claude auth login を実行し、通ったら claude を起動する
@@ -677,6 +759,7 @@ case "${1:-}" in
     usage) shift; cmd_usage "$@" ;;
     list|ls) cmd_list ;;
     sync) shift; [[ -n "${1:-}" ]] || die "使い方: cam sync <名前>"; sync_profile "$1" ;;
+    trust) trust_cwd ;;
     remove|rm) shift; cmd_remove "$@" ;;
     *) cat <<EOF
 cam: Claude Code をアカウントごとのコマンドで起動する
@@ -688,6 +771,7 @@ cam: Claude Code をアカウントごとのコマンドで起動する
   cam auto [引数]           7日枠の保護枠を残せるコマンドから選んで起動する
   cam usage [--json]        各コマンドの使用率と、cam auto が選ぶコマンド
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
+  cam trust                 今のフォルダを全アカウントで信頼済みにする（起動時に自動で行う）
   cam remove <名前>         コマンドとプロファイルを消す
 EOF
     ;;
