@@ -28,7 +28,7 @@ check() {  # check <説明> <実際の値> <期待する値>
 json() { "$CAM" usage --json | jq -r "$1"; }
 
 OK_BODY='{"five_hour":{"utilization":12.0,"resets_at":"2026-11-28T10:00:00.000000+00:00"},"seven_day":{"utilization":40.0,"resets_at":"2026-12-01T00:00:00+00:00"}}'
-EXPIRED_REASON="トークンの期限切れ。一度 coo を起動すると更新される"
+EXPIRED_REASON="トークンの期限切れ。一度 coo を起動するか、cam refresh coo で更新できる"
 
 # 1. 期限切れのトークンは API を呼ばずに notoken になる。期限切れのトークンで API は 429 を返す（2026-11-28 の実例）
 setup coo "{\"accessToken\":\"x\",\"expiresAt\":$PAST_MS}" '{"error":"rate_limited"}' 429

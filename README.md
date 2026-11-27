@@ -69,6 +69,7 @@ cam add coo --default  # ~/.claude のログインで起動する coo コマン�
 cam list               # コマンドとログイン中のアカウント
 cam auto               # 7日枠の保護枠を残せるコマンドから選んで起動する
 cam usage              # 各コマンドの使用率と、cam auto が選ぶコマンド（--json でメニューバー用）
+cam refresh            # 期限切れのトークンを Claude Code 本体に更新させる（名前を付けるとそのコマンドだけ）
 cam sync ceo           # 共有リンクと MCP を同期する（起動時にも自動で行う）
 cam trust              # 今のフォルダを全アカウントで信頼済みにする（起動時にも自動で行う）
 cam remove ceo         # コマンドとプロファイルを消す
@@ -97,9 +98,49 @@ cam remove ceo         # コマンドとプロファイルを消す
 - 使用率が取れず控えも無いコマンドは候補から外します。使えるコマンドが無く、使用率の分からないコマンドが1つでもあるときは、使用率の分からないコマンドから選んで起動し、各コマンドが取れなかった理由を表示します。上限と分かっているコマンドは選びません。5時間より前の控えがあり、その5時間枠のリセット時刻を過ぎていて、7日枠が100%でないコマンドを先に選びます。その中では `--default` のコマンド、無ければ `cam list` の順で先のコマンドを選びます
 - スコアが同じときは、`cam list` の順で先のコマンドを選びます
 
-使用率は、Claude Code が Keychain に保存したログインのトークンで `https://api.anthropic.com/api/oauth/usage` を呼んで取ります。この API は公開されていないので、仕様が変わると `cam auto` だけ動かなくなります。トークンの期限が切れているコマンドは、一度そのコマンドを起動すると Claude Code が更新します。期限切れのトークンでも API は 429 を返すことがあるので、Keychain の expiresAt で期限を確かめ、切れていれば API を呼ばずに「トークンの期限切れ」と出します。このときも控えがあれば控えの値を使い、期限切れの理由を一緒に出します。期限切れのコマンドも、起動すれば Claude Code がトークンを更新するので、5時間以内の控えなら `cam auto` の候補にします。Keychain には同じ項目名で acct の違う項目ができることがあるので、先に acct がログインユーザー名の項目を読み、トークンが無ければ acct を指定せずに読みます。
+使用率は、Claude Code が Keychain に保存したログインのトークンで `https://api.anthropic.com/api/oauth/usage` を呼んで取ります。この API は公開されていないので、仕様が変わると `cam auto` だけ動かなくなります。トークンの期限が切れているコマンドは、一度そのコマンドを起動するか、`cam refresh <名前>` を実行すると Claude Code が更新します。期限切れのトークンでも API は 429 を返すことがあるので、Keychain の expiresAt で期限を確かめ、切れていれば API を呼ばずに「トークンの期限切れ」と出します。このときも控えがあれば控えの値を使い、期限切れの理由を一緒に出します。期限切れのコマンドも、起動すれば Claude Code がトークンを更新するので、5時間以内の控えなら `cam auto` の候補にします。Keychain には同じ項目名で acct の違う項目ができることがあるので、先に acct がログインユーザー名の項目を読み、トークンが無ければ acct を指定せずに読みます。
 
 この API は、低い頻度で呼んでも 429（Rate limited）を返すことがあります。そのため、取れた値はコマンドごとに `~/.cam/usage-cache/<名前>` に控えておき、取れないときは控えを使います。`cam usage` では、控えの値に「◯時◯分時点の値」と付け、5時間より前の控えには「cam auto では使わない」と付けます。控えのリセット時刻を過ぎた枠は、使用率を 0% として扱います。
+
+## cam refresh
+
+`cam refresh` は、トークンの期限が切れたコマンドで Claude Code を1回走らせ、Claude Code 本体にトークンを更新させます。cam は refresh のエンドポイントを呼ばず、Keychain にも書きません。
+
+```bash
+cam refresh            # 期限切れか期限5分以内のコマンドを全部、1つずつ順に更新する
+cam refresh shared     # shared だけを更新する
+```
+
+走らせるのは次のコマンドです。作業フォルダは空の一時フォルダにし、標準入力は渡しません。
+
+```bash
+env -u <消す変数...> CLAUDE_CONFIG_DIR=<プロファイル> claude -p /usage --output-format json --tools "" \
+  --strict-mcp-config --setting-sources "" --no-session-persistence --debug-file ~/.cam/refresh-log/<名前>/debug.log
+```
+
+- `--default` のコマンドは、`CLAUDE_CONFIG_DIR` を付けずに走らせます。ロックと動いている claude は `~/.claude` で見ます
+- 消す変数は、`ANTHROPIC_` と `CLAUDE_CODE_` と `CLAUDE_PLUGIN_` で始まる変数、`CLAUDECODE`、`CLAUDE_PID`、`CLAUDE_EFFORT`、`CLAUDE_CONFIG_DIR`、`CLAUDE_ENV_FILE` です。Claude Code のセッションの中から呼んだときに、セッションのトークンや設定を引き継がないためです
+- 外から打ち切りません。打ち切ると、更新を送ったのに保存しないまま終わることがあるためです。走っている途中に Ctrl-C で止めないでください
+
+走らせると次のことが起きます。2026-11-28 に Claude Code 2.1.332 の shared で1回試した結果です（#23）。版や機能フラグが変わると変わることがあります。
+
+- 推論は呼びません。`/usage` は `-p` ではモデルに聞かずに答えるコマンドで、出力は `num_turns: 0`、`total_cost_usd: 0` でした。5時間の枠は、この実行では始まっていないと読めました（1回の観察からの読みです）
+- アクセストークンは更新した時刻の8時間後まで延びました
+- refresh token はサーバーで差し替わりました。前の refresh token は使えなくなったと考えてください。`refreshTokenExpiresAt` は延びませんでした
+- 1回あたり数秒かかります。初めて走らせるプロファイルでは、プラグインのマーケットプレイスの取得で長くなることがあります
+
+次のときは走らせず、飛ばした理由を出します。
+
+- 期限まで5分より先のとき。本体は期限の5分前まで更新しないので、走らせても延びません
+- トークンが無いとき、期限（`expiresAt`）が分からないとき
+- `refreshTokenExpiresAt` を過ぎているか分からないとき。そのコマンドを起動して `/login` してください
+- 同じコマンドを10分以内に試したとき。試した時刻は `~/.cam/refresh-at/<名前>` に残します。失敗も数えます
+- そのコマンドの claude が動いているとき。`ps eww` で、実行ファイルの名前が `claude` で `CLAUDE_CONFIG_DIR` がそのプロファイルのプロセスを探します。動いている claude は自分でトークンを更新します
+- ロック（`<プロファイル>/.oauth_refresh.lock` か `<プロファイル>.lock`）があるとき
+
+成否は、走らせた後に Keychain の `expiresAt` を読み直し、延びたかで決めます。終了コードは使いません。結果はコマンドごとに1行ずつ出し、1つでも更新されなかったら終了コード 1 で終わります。最後に走らせたときの debug ログと出力は `~/.cam/refresh-log/<名前>/` に残します。資格情報が空になったときは、そのコマンドを起動して `/login` してください。
+
+`cam auto` とメニューバーからは呼びません。
 
 ## メニューバー
 
@@ -118,6 +159,7 @@ menubar/install.sh   # ビルドして ~/Applications/CamBar.app に置き、ロ
 - `cam remove` は Keychain の項目を消しません
 - MCP と信頼済みフォルダの同期の回帰テストは `tests/mcp_sync_test.sh` です。HOME を一時ディレクトリに替えて動かします
 - 起動時に信頼済みにする試験は `tests/trust_on_launch_test.sh` です。HOME を一時ディレクトリに替え、偽の claude を PATH の先頭に置いて動かします
+- `cam refresh` の試験は `tests/refresh_test.sh` です。HOME を一時ディレクトリに替え、Keychain の代わりのファイルの expiresAt を延ばす偽の claude を PATH の先頭に置いて動かします
 - 変わっていない `cam sync` が何も書かないことと、入力が変わったら同期し直すことの試験は `tests/sync_unchanged_test.sh` です
 - 起動用コマンドの前段（`cam trust` と `cam sync`）の時間は、`bench/launch_prefix.sh [回数] [比べる版]` で測ります。本物の設定を一時 HOME に写して、2つの版を交互に走らせます
 
