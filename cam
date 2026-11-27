@@ -592,6 +592,7 @@ oauth_of() {
 # 期限切れのトークンでも API は 401 でなく 429 を返すことがあり、limited と見分けられないため（issue #17）。
 # /api/oauth/usage は公開されていない API で、低い頻度でも 429 を返すことがある。
 # CAM_TEST_API にファイルを渡すと、API を呼ばずにその中身を「本文、改行、HTTP の状態コード」として使う（試験用）。
+# ディレクトリを渡すと、その中の <名前> のファイルを同じように使う。
 usage_of() {
     local oauth tok exp res code body line
     oauth=$(oauth_of "$1")
@@ -602,7 +603,9 @@ usage_of() {
         echo "notoken - - 0 0 expired"
         return 0
     fi
-    if [[ -n "${CAM_TEST_API:-}" ]]; then
+    if [[ -d "${CAM_TEST_API:-}" ]]; then
+        res=$(cat "$CAM_TEST_API/$1")
+    elif [[ -n "${CAM_TEST_API:-}" ]]; then
         res=$(cat "$CAM_TEST_API")
     else
         res=$(curl -s -m 5 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
@@ -856,11 +859,20 @@ cmd_usage() {
 
 # 7日枠の保護枠を残す方式で選んだコマンドを、何も表示せずに起動する。
 # 保護枠を使うときは1行だけ知らせる。全コマンドが上限なら起動しない。
+# 通常候補が無い（fallback か unknown）とき、トークンの期限切れで値の分からないコマンドがあれば、
+# cam refresh で1つずつ更新し、使用率を取り直してから選び直す（issue #29。auto_refresh）。
 cmd_auto() {
-    local rows mode best next_at
+    local rows mode best next_at targets
     rows=$(collect_usage)
     [[ -n "$rows" ]] || die "コマンドがありません（cam add）"
     read -r mode best next_at <<<"$(choose_of <<<"$rows")"
+    if [[ "$mode" == fallback || "$mode" == unknown ]]; then
+        targets=$(auto_refresh_targets <<<"$rows")
+        if [[ -n "$targets" ]]; then
+            rows=$(auto_refresh "$rows" "$targets")
+            read -r mode best next_at <<<"$(choose_of <<<"$rows")"
+        fi
+    fi
     case "$mode" in
         normal) ;;
         fallback)
@@ -1004,6 +1016,47 @@ refresh_one() {
     return 1
 }
 
+# ---- cam auto での更新（issue #29） ----
+# cam auto が更新するコマンドの名前を1行ずつ出す。入力は collect_usage の行。
+# 対象は、わけが expired（トークンの期限切れ）で、choose_of が値を使えないコマンド。
+# 値を使えないのは、使用率が取れず控えも無いときと、控えが STALE_SECONDS より古いとき。
+# 5時間以内の控えがあるコマンドは choose_of が控えの値で選ぶので、更新しても選ぶ結果は変わらない。
+auto_refresh_targets() {
+    awk -v now="${CAM_TEST_NOW:-$(date +%s)}" -v stale="$STALE_SECONDS" '
+        $8 == "expired" && !($2 == "ok" || ($2 == "cached" && now - $7 <= stale)) { print $1 }'
+}
+
+# トークンの期限（expiresAt）が今より先なら 0 を返す
+token_valid() {
+    local exp
+    exp=$(oauth_of "$1" | jq -r '.expiresAt | numbers | . / 1000 | floor' 2>/dev/null)
+    [[ -n "$exp" ]] && (( exp > $(date +%s) ))
+}
+
+# auto_refresh <collect_usage の行> <対象の名前（改行区切り）>
+# 対象を refresh_one で1つずつ順に更新し、トークンが期限内になったコマンドだけ usage_row で取り直す。
+# 取り直した行を、元の行と同じ並びで出す。進み具合は stderr に、コマンドごとに1行出す。
+# 走らせる前に行の前半を出し、終わったら refresh_one の結果を同じ行に続ける。
+# refresh_one が飛ばしたときと失敗したときも止めない。そのコマンドは元の行のまま選ぶ。
+auto_refresh() {
+    local rows="$1" name line fresh=" "
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        printf 'cam: %s のトークンが期限切れなので更新します（cam refresh %s、1つ数秒）… ' "$name" "$name" >&2
+        # 対象の名前は標準入力から読んでいるので、中で走るもの（security、ps、claude）には渡さない
+        line=$(refresh_one "$name" </dev/null) || true
+        line=${line#"$name"}
+        line=${line#"${line%%[! ]*}"}
+        echo "${line:-結果が分からない}" >&2
+        token_valid "$name" && fresh+="$name "
+    done <<<"$2"
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        name=${line%% *}
+        if [[ "$fresh" == *" $name "* ]]; then usage_row "$name" </dev/null; else echo "$line"; fi
+    done <<<"$rows"
+}
+
 # cam refresh [名前...]。名前を省くと、期限切れか期限5分以内で、refresh token の期限が先のコマンドを全部、1つずつ順に更新する。
 # 対象でないコマンドも、飛ばした理由を1行ずつ出す。1つでも更新に失敗したら終了コード 1
 cmd_refresh() {
@@ -1045,6 +1098,7 @@ cam: Claude Code をアカウントごとのコマンドで起動する
   cam add <名前> --no-login 作るだけでログインと起動はしない
   cam list                  コマンドとログイン中のアカウント
   cam auto [引数]           7日枠の保護枠を残せるコマンドから選んで起動する
+                            （通常候補が無ければ、期限切れのコマンドを cam refresh で更新してから選ぶ）
   cam usage [--json]        各コマンドの使用率と、cam auto が選ぶコマンド
   cam refresh [名前...]     期限切れのトークンを Claude Code 本体に更新させる
                             （名前を省くと、期限切れか期限5分以内のコマンドを全部）
