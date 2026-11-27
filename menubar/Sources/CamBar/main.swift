@@ -7,8 +7,9 @@ import SwiftUI
 struct Account: Decodable, Identifiable {
     let name: String
     let email: String
-    // ok・cached（API に断られ、前回の値を使っている）・limited・notoken・error。古い cam には無い
+    // ok・cached（API から取れず、前回取れた控えの値を出している）・limited・notoken・error。古い cam には無い
     let status: String?
+    // 使用率が取れない理由。ok と cached では null だが、トークンの期限切れの控え（cached）には入る
     let reason: String?
     let as_of: Double?
     let five_hour: Double?
@@ -20,6 +21,8 @@ struct Account: Decodable, Identifiable {
 
 struct Usage: Decodable {
     let best: String?
+    // cam auto の選び方。normal・fallback・none（値の分かる全コマンドが上限）・unknown（判定できない）。古い cam には無い
+    let choice: String?
     let fetched_at: Double
     let accounts: [Account]
 }
@@ -64,10 +67,12 @@ func color(_ v: Double?) -> Color {
     return .primary
 }
 
-func clockText(_ epoch: Double) -> String {
+// 控えの値を取った時刻。前日以前なら日付も付ける
+func asOfText(_ epoch: Double, now: Date) -> String {
+    let date = Date(timeIntervalSince1970: epoch)
     let f = DateFormatter()
-    f.dateFormat = "H:mm"
-    return f.string(from: Date(timeIntervalSince1970: epoch))
+    f.dateFormat = Calendar.current.isDate(date, inSameDayAs: now) ? "H:mm" : "M/d H:mm"
+    return f.string(from: date)
 }
 
 func resetText(_ epoch: Double?, _ format: String) -> String {
@@ -81,6 +86,7 @@ func resetText(_ epoch: Double?, _ format: String) -> String {
 struct UsageView: View {
     let usage: Usage?
     let error: String?
+    var now = Date()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -97,6 +103,15 @@ struct UsageView: View {
                     .foregroundStyle(.secondary)
                     ForEach(usage.accounts) { a in
                         row(a, best: a.name == usage.best)
+                        // 控えの値の理由（トークンの期限切れなど）は、名前の列を広げないよう行の下に全幅で出す
+                        if a.status == "cached", a.five_hour != nil, let reason = a.reason {
+                            GridRow {
+                                Text(reason)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .gridCellColumns(5)
+                            }
+                        }
                     }
                 }
             }
@@ -123,7 +138,7 @@ struct UsageView: View {
                 Text(best ? "*\(a.name)" : a.name).font(.system(size: 13))
                 Text(a.email).font(.system(size: 10)).foregroundStyle(.secondary)
                 if a.status == "cached", let asOf = a.as_of {
-                    Text(clockText(asOf) + " 時点の値").font(.system(size: 10)).foregroundStyle(.orange)
+                    Text(asOfText(asOf, now: now) + " 時点の値").font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
             if a.five_hour == nil {
@@ -215,15 +230,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // メニューバーには cam auto が選ぶコマンドとその5時間枠を出す
     func updateTitle() {
-        guard let button = item.button else { return }
-        if let usage, let best = usage.best, let a = usage.accounts.first(where: { $0.name == best }) {
-            button.title = " \(best) \(percent(a.five_hour))"
-        } else if usage != nil {
-            button.title = " なし"
-        } else {
-            button.title = error == nil ? " …" : " ?"
-        }
+        item.button?.title = menuTitle(usage, error: error)
     }
+}
+
+func menuTitle(_ usage: Usage?, error: String?) -> String {
+    if let usage, let best = usage.best, let a = usage.accounts.first(where: { $0.name == best }) {
+        return " \(best) \(percent(a.five_hour))"
+    } else if usage?.choice == "unknown" {
+        // 使えるコマンドが無く、使用率の分からないコマンドがある。全部上限（none）とは分ける
+        return " 不明"
+    } else if usage != nil {
+        return " なし"
+    } else {
+        return error == nil ? " …" : " ?"
+    }
+}
+
+// AppDelegate はメニューバーに項目を作るので、描くだけのときはその前に終わる
+if CommandLine.arguments.count > 1, CommandLine.arguments[1] == "--render" {
+    MainActor.assumeIsolated { renderPreview(Array(CommandLine.arguments.dropFirst(2))) }
 }
 
 let app = NSApplication.shared
