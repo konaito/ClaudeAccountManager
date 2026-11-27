@@ -760,7 +760,7 @@ choose_of() {
 # わけが expired なら、状態（notoken か cached）にかかわらず期限切れの理由を出す。
 reason_of() {
     if [[ "${3:-}" == expired ]]; then
-        echo "トークンの期限切れ。一度 $2 を起動すると更新される"
+        echo "トークンの期限切れ。一度 $2 を起動するか、cam refresh $2 で更新できる"
         return 0
     fi
     case "$1" in
@@ -877,8 +877,160 @@ cmd_auto() {
     exec "$BIN/$best" "$@"
 }
 
+# ---- cam refresh（issue #23） ----
+# トークンの期限が切れたコマンドで claude -p /usage を1回走らせ、Claude Code 本体にトークンを更新させる。
+# cam は refresh のエンドポイントを呼ばず、Keychain にも書かない。更新、ロック、保存は本体が行う。
+# /usage は -p ではモデルに聞かずに答えるローカルのコマンドで、推論を呼ばない（#23 の shared の実測で num_turns 0、費用 0）。
+# 本体は使用量を取りに行く前に更新を待ち、保存してから終わる。外から打ち切ると、更新を送ったのに保存しないまま
+# 終わることがあるので、打ち切りは付けない。
+REFRESH_AT="$CAM_HOME/refresh-at"     # コマンドごとに、最後に試した時刻（epoch 秒）
+REFRESH_LOG="$CAM_HOME/refresh-log"   # コマンドごとに、最後に走らせたときの debug ログと出力
+REFRESH_INTERVAL=600                  # 同じコマンドは10分に1回まで（失敗も数える）
+REFRESH_MARGIN=300                    # 期限の5分前から更新する（本体と同じ）
+
+# そのコマンドの設定ディレクトリ。--default のコマンドは ~/.claude
+config_dir_of() {
+    if [[ -d "$PROFILES/$1" ]]; then echo "$PROFILES/$1"; else echo "$MASTER"; fi
+}
+
+# 動いている claude（実行ファイルの名前が claude）を「pid コマンドと環境変数」の1行ずつで出す。
+# CAM_TEST_PS にファイルを渡すと、ps を使わずにその中身を返す（試験用）。
+claude_procs() {
+    local pids
+    if [[ -n "${CAM_TEST_PS:-}" ]]; then
+        cat "$CAM_TEST_PS"
+        return 0
+    fi
+    pids=$(ps -axo pid=,comm= 2>/dev/null | awk '{p = $1; $1 = ""; sub(/^ +/, ""); n = split($0, a, "/"); if (a[n] == "claude") printf "%s%s", (c++ ? "," : ""), p}')
+    [[ -n "$pids" ]] || return 0
+    ps eww -o pid=,command= -p "$pids" 2>/dev/null || true
+}
+
+# その設定ディレクトリで動いている claude の pid を空白区切りで出す。
+# ps eww の行は引数と環境変数をつないだ文字なので、「 CLAUDE_CONFIG_DIR=<ディレクトリ> 」の並びで探す。
+# ~/.claude のコマンドは、CLAUDE_CONFIG_DIR=/… を持たない claude と、~/.claude を指す claude を数える。
+# 引数に同じ並びの文字を含む claude も数えるが、走らせない側に倒れるだけなので見分けない。
+running_pids_of() {
+    local dir="$1" pid rest line found=""
+    while read -r pid rest; do
+        [[ -n "$pid" ]] || continue
+        line=" $rest "
+        if [[ "$line" == *" CLAUDE_CONFIG_DIR=$dir "* ]] \
+            || [[ "$dir" == "$MASTER" && "$line" != *" CLAUDE_CONFIG_DIR=/"* ]]; then
+            found+="${found:+ }$pid"
+        fi
+    done < <(claude_procs)
+    echo "$found"
+}
+
+# 1コマンドぶんを更新する。結果を「名前 結果」の1行で出す。失敗なら 1 を返す（飛ばしたときは 0）。
+refresh_one() {
+    local name="$1" dir oauth exp rexp now at pids lock rc after_oauth after_exp log work v
+    local -a cmd=(env) vars=()
+    now=$(date +%s)
+    dir=$(config_dir_of "$name")
+    oauth=$(oauth_of "$name")
+    if [[ -z "$oauth" ]]; then
+        printf '%-10s 飛ばした: トークンが無い。%s を起動して /login する\n' "$name" "$name"
+        return 0
+    fi
+    exp=$(jq -r '.expiresAt | numbers | . / 1000 | floor' <<<"$oauth" 2>/dev/null)
+    rexp=$(jq -r '.refreshTokenExpiresAt | numbers | . / 1000 | floor' <<<"$oauth" 2>/dev/null)
+    if [[ -z "$exp" ]]; then
+        printf '%-10s 飛ばした: トークンの期限（expiresAt）が分からない\n' "$name"
+        return 0
+    fi
+    if (( exp - REFRESH_MARGIN > now )); then
+        printf '%-10s 飛ばした: 期限内（%s まで）\n' "$name" "$(date -r "$exp" '+%-m/%-d %H:%M')"
+        return 0
+    fi
+    if [[ -z "$rexp" ]] || (( rexp <= now )); then
+        printf '%-10s 飛ばした: refresh token の期限切れか期限が分からない。%s を起動して /login する\n' "$name" "$name"
+        return 0
+    fi
+    if [[ -f "$REFRESH_AT/$name" ]] && read -r at <"$REFRESH_AT/$name" && [[ "$at" =~ ^[0-9]+$ ]] \
+        && (( now - at < REFRESH_INTERVAL )); then
+        printf '%-10s 飛ばした: %s に試したばかり（10分に1回まで）\n' "$name" "$(date -r "$at" '+%H:%M')"
+        return 0
+    fi
+    pids=$(running_pids_of "$dir")
+    if [[ -n "$pids" ]]; then
+        printf '%-10s 飛ばした: %s の claude が動いている（pid %s）。動いている claude が自分で更新する\n' "$name" "$name" "$pids"
+        return 0
+    fi
+    for lock in "$dir/.oauth_refresh.lock" "$dir.lock"; do
+        if [[ -e "$lock" || -L "$lock" ]]; then
+            printf '%-10s 飛ばした: ロックがある（%s）\n' "$name" "$lock"
+            return 0
+        fi
+    done
+
+    # ここから下は || の中から呼ばれるので set -e が効かない。時刻を残せないときと、
+    # 一時フォルダを作れないときは走らせない（10分の決まりが働かず、呼んだ人のフォルダで走るため）
+    log="$REFRESH_LOG/$name"
+    if ! { mkdir -p "$REFRESH_AT" "$log" && chmod 700 "$REFRESH_LOG" "$log" && echo "$now" >"$REFRESH_AT/$name"; }; then
+        printf '%-10s 走らせなかった: %s か %s に書けない\n' "$name" "$REFRESH_AT" "$log"
+        return 1
+    fi
+    rm -f "$log/debug.log" "$log/out.json" "$log/err.txt"
+    # cam は Claude Code のセッションの中から呼ばれることが多い。セッションから継いだ変数
+    # （CLAUDE_CODE_OAUTH_TOKEN、CLAUDECODE、CLAUDE_CODE_SESSION_ID など）と API キーを消してから走らせる。
+    # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC があると /usage が使用量を取りに行かず、更新を待たない（cc-switch のコメント）
+    while IFS= read -r v; do
+        [[ -n "$v" ]] && vars+=("$v")
+    done < <(compgen -e | grep -E '^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_PLUGIN_)|^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_CONFIG_DIR|CLAUDE_ENV_FILE)$' || true)
+    for v in ${vars[@]+"${vars[@]}"}; do cmd+=(-u "$v"); done
+    [[ "$dir" != "$MASTER" ]] && cmd+=("CLAUDE_CONFIG_DIR=$dir")
+    cmd+=(claude -p /usage --output-format json --tools "" --strict-mcp-config --setting-sources ""
+          --no-session-persistence --debug-file "$log/debug.log")
+    if ! work=$(mktemp -d) || [[ ! -d "$work" ]] || [[ -n "$(ls -A "$work")" ]]; then
+        printf '%-10s 走らせなかった: 空の一時フォルダを作れない\n' "$name"
+        return 1
+    fi
+    if (cd "$work" && "${cmd[@]}" </dev/null >"$log/out.json" 2>"$log/err.txt"); then rc=0; else rc=$?; fi
+    rm -rf "$work"
+
+    after_oauth=$(oauth_of "$name")
+    if [[ -z "$after_oauth" ]]; then
+        printf '%-10s 資格情報が空になった。%s を起動して /login する（ログ: %s）\n' "$name" "$name" "$log"
+        return 1
+    fi
+    after_exp=$(jq -r '.expiresAt | numbers | . / 1000 | floor' <<<"$after_oauth" 2>/dev/null)
+    if [[ -n "$after_exp" ]] && (( after_exp > ${exp:-0} && after_exp > now )); then
+        printf '%-10s 更新した（期限 %s まで）\n' "$name" "$(date -r "$after_exp" '+%-m/%-d %H:%M')"
+        return 0
+    fi
+    printf '%-10s 更新されなかった（終了コード %s。ログ: %s）。一度 %s を起動して確かめる\n' "$name" "$rc" "$log" "$name"
+    return 1
+}
+
+# cam refresh [名前...]。名前を省くと、期限切れか期限5分以内で、refresh token の期限が先のコマンドを全部、1つずつ順に更新する。
+# 対象でないコマンドも、飛ばした理由を1行ずつ出す。1つでも更新に失敗したら終了コード 1
+cmd_refresh() {
+    local name f bad=0
+    local -a names=()
+    for name in "$@"; do
+        valid_name "$name"
+        [[ "$name" != cam && -e "$BIN/$name" ]] || die "$name はありません（cam list）"
+        names+=("$name")
+    done
+    if [[ ${#names[@]} -eq 0 ]]; then
+        shopt -s nullglob
+        for f in "$BIN"/*; do
+            [[ "${f##*/}" == cam ]] || names+=("${f##*/}")
+        done
+        shopt -u nullglob
+        [[ ${#names[@]} -gt 0 ]] || die "コマンドがありません（cam add）"
+    fi
+    for name in "${names[@]}"; do
+        refresh_one "$name" || bad=1
+    done
+    return $bad
+}
+
 case "${1:-}" in
     add) shift; cmd_add "$@" ;;
+    refresh) shift; cmd_refresh "$@" ;;
     auto) shift; cmd_auto "$@" ;;
     usage) shift; cmd_usage "$@" ;;
     list|ls) cmd_list ;;
@@ -894,6 +1046,8 @@ cam: Claude Code をアカウントごとのコマンドで起動する
   cam list                  コマンドとログイン中のアカウント
   cam auto [引数]           7日枠の保護枠を残せるコマンドから選んで起動する
   cam usage [--json]        各コマンドの使用率と、cam auto が選ぶコマンド
+  cam refresh [名前...]     期限切れのトークンを Claude Code 本体に更新させる
+                            （名前を省くと、期限切れか期限5分以内のコマンドを全部）
   cam sync <名前>           共有リンクと MCP を同期（起動時に自動で行う）
   cam trust                 今のフォルダを全アカウントで信頼済みにする（起動時に自動で行う）
   cam remove <名前>         コマンドとプロファイルを消す
